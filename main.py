@@ -51,14 +51,16 @@ train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn
 test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-5)
-scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
+optimizers = [optim.Adam(model.roberta.parameters(), lr=1e-5),
+              optim.Adam(model.classifier.parameters(), lr=1e-3)]
+schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
+              for optimizer in optimizers]
 
 print("CUDA: %d" % torch.cuda.is_available())
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 writer = SummaryWriter()
-step = 0
+step, best_acc = 0, 0
 model.to(device)
 for epoch in range(10):
     with tqdm(train_loader, desc="Epoch %d" % epoch) as tbar:
@@ -70,12 +72,16 @@ for epoch in range(10):
             loss = criterion(outputs["logits"], batch["labels"])
             tbar.set_postfix(loss=loss.item())
             writer.add_scalar("train_loss", loss, global_step=step)
-            optimizer.zero_grad()
+            for optimizer in optimizers:
+                optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
-            scheduler.step()
+            for optimizer in optimizers:
+                optimizer.step()
+            for scheduler in schedulers:
+                scheduler.step()
             if step % 500 == 0:
                 with torch.no_grad():
+                    model.eval()
                     with tqdm(test_loader, desc="Evaluate test") as test_tbar:
                         correct, count = 0, 0
                         for batch in test_tbar:
@@ -87,8 +93,10 @@ for epoch in range(10):
                             correct += (batch["labels"] == pred).float().sum()
                             count += batch["labels"].shape[0]
                             test_tbar.set_postfix(test_acc=(correct/count).item())
-                        writer.add_scalar("test_acc", correct/count, global_step=step)
+                        acc = correct / count
+                        writer.add_scalar("test_acc", acc, global_step=step)
+                    model.train()
+                if acc > best_acc:
+                    torch.save(model.state_dict(), "model_best.pt")
             step += 1
-
-                            
 
