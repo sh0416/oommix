@@ -81,8 +81,10 @@ class Roberta(nn.Module):
             for _ in range(n_layer)
         ])
         self.classifier = nn.Sequential(
+            nn.Dropout(p=drop_prob),
             nn.Linear(embed_dim, 128),
             nn.Tanh(),
+            nn.Dropout(p=drop_prob),
             nn.Linear(128, 4)
         )
         self.dropout = nn.Dropout(p=drop_prob)
@@ -112,7 +114,7 @@ class Roberta(nn.Module):
             o = o.view(batch, seq_len, -1)  # [b, h, s, d]
             h = module_dict["norm"](h + self.dropout(module_dict["out"](o)))
             h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
-        return h
+        return self.classifier(h[:, 0, :])
 
     def load(self):
         model = RobertaModel.from_pretrained("roberta-base")
@@ -136,17 +138,16 @@ test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news", "test.csv"))
 
 
 tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
-model = RobertaForSequenceClassification.from_pretrained("roberta-base", output_hidden_states=True,
-output_attentions=True, return_dict=True, num_labels=4)
-print(model)
-my_model = Roberta()
-my_model.load()
+#model = RobertaForSequenceClassification.from_pretrained("roberta-base", output_hidden_states=True,
+#output_attentions=True, return_dict=True, num_labels=4)
+#print(model)
+model = Roberta()
+model.load()
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=CollateFn(tokenizer))
 test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
 
 criterion = nn.CrossEntropyLoss()
-optimizers = [optim.Adam(model.roberta.parameters(), lr=1e-5),
-              optim.Adam(model.classifier.parameters(), lr=1e-3)]
+optimizers = [optim.Adam(model.parameters(), lr=1e-5)]
 schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
               for optimizer in optimizers]
 
@@ -160,17 +161,17 @@ for epoch in range(10):
     with tqdm(train_loader, desc="Epoch %d" % epoch) as tbar:
         for batch in tbar:
             model.eval()
-            my_model.eval()
+            #my_model.eval()
             batch["inputs"]["input_ids"] = batch["inputs"]["input_ids"].to(device) 
             batch["inputs"]["attention_mask"] = batch["inputs"]["attention_mask"].to(device) 
             batch["labels"] = batch["labels"].to(device)
             outputs = model(**batch["inputs"])
-            my_outputs = my_model(**batch["inputs"])
+            #my_outputs = my_model(**batch["inputs"])
             #print((my_outputs[0] - outputs["attentions"][0]).abs().max())
             #print((my_outputs[1] - outputs["hidden_states"][1]).abs().max())
-            print((my_outputs - outputs["hidden_states"][12]).abs().max())
-            assert False
-            loss = criterion(outputs["logits"], batch["labels"])
+            #print((my_outputs - outputs["hidden_states"][12]).abs().max())
+            #loss = criterion(outputs["logits"], batch["labels"])
+            loss = criterion(outputs, batch["labels"])
             tbar.set_postfix(loss=loss.item())
             writer.add_scalar("train_loss", loss, global_step=step)
             for optimizer in optimizers:
