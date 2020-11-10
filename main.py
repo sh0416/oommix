@@ -1,6 +1,7 @@
 import os
 import csv
 import math
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -168,68 +169,73 @@ class TMixRoberta(Roberta):
         return self.classifier(h[:, 0, :])
 
 
-train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news", "train.csv"))
-test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news", "test.csv"))
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mixup_layer", type=int, default=0)
+    args = parser.parse_args()
+
+    train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news", "train.csv"))
+    test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news", "test.csv"))
 
 
-tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
-#model = Roberta()
-model = TMixRoberta()
-model.load()
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=CollateFn(tokenizer))
-test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
+    tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+    #model = Roberta()
+    model = TMixRoberta(mixup_layer=args.mixup_layer)
+    model.load()
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=CollateFn(tokenizer))
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
 
-criterion = nn.CrossEntropyLoss()
-optimizers = [optim.Adam(model.parameters(), lr=1e-5)]
-schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
-              for optimizer in optimizers]
+    criterion = nn.CrossEntropyLoss()
+    optimizers = [optim.Adam(model.parameters(), lr=1e-5)]
+    schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
+                for optimizer in optimizers]
 
-print("CUDA: %d" % torch.cuda.is_available())
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("CUDA: %d" % torch.cuda.is_available())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-writer = SummaryWriter()
-step, best_acc = 0, 0
-model.to(device)
-for epoch in range(10):
-    with tqdm(train_loader, desc="Epoch %d" % epoch) as tbar:
-        for batch in tbar:
-            input_ids = batch["inputs"]["input_ids"].to(device) 
-            attention_mask = batch["inputs"]["attention_mask"].to(device) 
-            labels = batch["labels"].to(device)
-            mixup_indices = torch.randperm(input_ids.shape[0], device=device)
-            alpha = np.random.beta(0.5, 0.5)
-            if alpha < 0.5:
-                alpha = 1 - alpha
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, alpha=alpha)
-            loss = alpha * criterion(outputs, labels) + (1 - alpha) * criterion(outputs, labels[mixup_indices])
-            tbar.set_postfix(loss=loss.item())
-            writer.add_scalar("train_loss", loss, global_step=step)
-            for optimizer in optimizers:
-                optimizer.zero_grad()
-            loss.backward()
-            for optimizer in optimizers:
-                optimizer.step()
-            for scheduler in schedulers:
-                scheduler.step()
-            if step % 500 == 0:
-                with torch.no_grad():
-                    model.eval()
-                    with tqdm(test_loader, desc="Evaluate test") as test_tbar:
-                        correct, count = 0, 0
-                        for batch in test_tbar:
-                            batch["inputs"]["input_ids"] = batch["inputs"]["input_ids"].to(device) 
-                            batch["inputs"]["attention_mask"] = batch["inputs"]["attention_mask"].to(device) 
-                            batch["labels"] = batch["labels"].to(device)
-                            outputs = model(**batch["inputs"])
-                            #pred = outputs["logits"].argmax(dim=1)
-                            pred = outputs.argmax(dim=1)
-                            correct += (batch["labels"] == pred).float().sum()
-                            count += batch["labels"].shape[0]
-                            test_tbar.set_postfix(test_acc=(correct/count).item())
-                        acc = correct / count
-                        writer.add_scalar("test_acc", acc, global_step=step)
-                    model.train()
-                if acc > best_acc:
-                    torch.save(model.state_dict(), "model_best.pt")
-            step += 1
+    writer = SummaryWriter()
+    step, best_acc = 0, 0
+    model.to(device)
+    for epoch in range(10):
+        with tqdm(train_loader, desc="Epoch %d" % epoch) as tbar:
+            for batch in tbar:
+                input_ids = batch["inputs"]["input_ids"].to(device) 
+                attention_mask = batch["inputs"]["attention_mask"].to(device) 
+                labels = batch["labels"].to(device)
+                mixup_indices = torch.randperm(input_ids.shape[0], device=device)
+                lambda_ = np.random.beta(0.3, 0.3)
+                if lambda_ < 0.5:
+                    lambda_ = 1 - lambda_
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, alpha=lambda_)
+                loss = lambda_ * criterion(outputs, labels) + (1 - lambda_) * criterion(outputs, labels[mixup_indices])
+                tbar.set_postfix(loss=loss.item())
+                writer.add_scalar("train_loss", loss, global_step=step)
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
+                loss.backward()
+                for optimizer in optimizers:
+                    optimizer.step()
+                for scheduler in schedulers:
+                    scheduler.step()
+                if step % 500 == 0:
+                    with torch.no_grad():
+                        model.eval()
+                        with tqdm(test_loader, desc="Evaluate test") as test_tbar:
+                            correct, count = 0, 0
+                            for batch in test_tbar:
+                                batch["inputs"]["input_ids"] = batch["inputs"]["input_ids"].to(device) 
+                                batch["inputs"]["attention_mask"] = batch["inputs"]["attention_mask"].to(device) 
+                                batch["labels"] = batch["labels"].to(device)
+                                outputs = model(**batch["inputs"])
+                                #pred = outputs["logits"].argmax(dim=1)
+                                pred = outputs.argmax(dim=1)
+                                correct += (batch["labels"] == pred).float().sum()
+                                count += batch["labels"].shape[0]
+                                test_tbar.set_postfix(test_acc=(correct/count).item())
+                            acc = correct / count
+                            writer.add_scalar("test_acc", acc, global_step=step)
+                        model.train()
+                    if acc > best_acc:
+                        torch.save(model.state_dict(), "model_best.pt")
+                step += 1
 
