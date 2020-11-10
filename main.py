@@ -8,11 +8,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from transformers import BertModel, BertConfig, BertTokenizer
 from transformers import RobertaTokenizer, RobertaForSequenceClassification
 from transformers import RobertaConfig, RobertaModel
 from tqdm import tqdm
 
-config = RobertaConfig.from_pretrained("roberta-base")
+#config = RobertaConfig.from_pretrained("roberta-base")
+config = BertConfig.from_pretrained("bert-base-uncased")
 print(config)
 
 # AG News: https://www.kaggle.com/amananandrai/ag-news-classification-dataset
@@ -59,12 +61,14 @@ def masked_softmax(vec, mask, dim=1):
 
 
 class Roberta(nn.Module):
-    def __init__(self, vocab_size=50265, embed_dim=768, padding_idx=1, max_length=514, drop_prob=0.1,
+    #def __init__(self, vocab_size=50265, embed_dim=768, padding_idx=1, max_length=514, drop_prob=0.1,
+    #             n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12):
+    def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
                  n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12):
         super().__init__()
         self.word_embeddings = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
         self.position_embeddings = nn.Embedding(max_length, embed_dim, padding_idx=padding_idx)
-        self.token_type_embeddings = nn.Embedding(1, embed_dim)
+        self.token_type_embeddings = nn.Embedding(2, embed_dim)
         self.embedding_norm = nn.LayerNorm(embed_dim)
         self.encoder = nn.ModuleList([
             nn.ModuleDict({
@@ -98,10 +102,11 @@ class Roberta(nn.Module):
     def forward(self, input_ids, attention_mask):
         batch, seq_len = input_ids.shape
         word = self.word_embeddings(input_ids)
-        position_ids = torch.arange(self.padding_idx + 1, self.padding_idx + 1 + seq_len,
-                                    device=input_ids.device)
+        #position_ids = torch.arange(self.padding_idx + 1, self.padding_idx + 1 + seq_len,
+        #                            device=input_ids.device)
+        position_ids = torch.arange(0, seq_len, device=input_ids.device)
         position_ids = position_ids[None, :].expand(batch, -1)
-        position_ids = torch.where(attention_mask.bool(), position_ids, torch.ones_like(position_ids))
+        #position_ids = torch.where(attention_mask.bool(), position_ids, torch.ones_like(position_ids))
         position = self.position_embeddings(position_ids)
         token_type_ids = torch.zeros_like(position_ids)
         token_type = self.token_type_embeddings(token_type_ids)
@@ -119,7 +124,8 @@ class Roberta(nn.Module):
         return self.classifier(h[:, 0, :])
 
     def load(self):
-        model = RobertaModel.from_pretrained("roberta-base")
+        #model = RobertaModel.from_pretrained("roberta-base")
+        model = BertModel.from_pretrained("bert-base-uncased")
         self.word_embeddings.load_state_dict(model.embeddings.word_embeddings.state_dict())
         self.position_embeddings.load_state_dict(model.embeddings.position_embeddings.state_dict())
         self.token_type_embeddings.load_state_dict(model.embeddings.token_type_embeddings.state_dict())
@@ -178,9 +184,10 @@ if __name__ == "__main__":
     test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news", "test.csv"))
 
 
-    tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
-    #model = Roberta()
-    model = TMixRoberta(mixup_layer=args.mixup_layer)
+    #tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    model = Roberta()
+    #model = TMixRoberta(mixup_layer=args.mixup_layer)
     model.load()
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=CollateFn(tokenizer))
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
@@ -206,9 +213,10 @@ if __name__ == "__main__":
                 lambda_ = np.random.beta(0.3, 0.3)
                 if lambda_ < 0.5:
                     lambda_ = 1 - lambda_
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, alpha=lambda_)
+                #outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, alpha=lambda_)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 loss = lambda_ * criterion(outputs, labels) + (1 - lambda_) * criterion(outputs, labels[mixup_indices])
-                tbar.set_postfix(loss=loss.item())
+                tbar.set_postfix(loss="%.4f" % loss.item())
                 writer.add_scalar("train_loss", loss, global_step=step)
                 for optimizer in optimizers:
                     optimizer.zero_grad()
@@ -223,14 +231,14 @@ if __name__ == "__main__":
                         with tqdm(test_loader, desc="Evaluate test") as test_tbar:
                             correct, count = 0, 0
                             for batch in test_tbar:
-                                batch["inputs"]["input_ids"] = batch["inputs"]["input_ids"].to(device) 
-                                batch["inputs"]["attention_mask"] = batch["inputs"]["attention_mask"].to(device) 
-                                batch["labels"] = batch["labels"].to(device)
-                                outputs = model(**batch["inputs"])
+                                input_ids = batch["inputs"]["input_ids"].to(device) 
+                                attention_mask = batch["inputs"]["attention_mask"].to(device) 
+                                labels = batch["labels"].to(device)
+                                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                                 #pred = outputs["logits"].argmax(dim=1)
                                 pred = outputs.argmax(dim=1)
-                                correct += (batch["labels"] == pred).float().sum()
-                                count += batch["labels"].shape[0]
+                                correct += (labels == pred).float().sum()
+                                count += labels.shape[0]
                                 test_tbar.set_postfix(test_acc=(correct/count).item())
                             acc = correct / count
                             writer.add_scalar("test_acc", acc, global_step=step)
