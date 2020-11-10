@@ -191,7 +191,8 @@ for epoch in range(10):
                             batch["inputs"]["attention_mask"] = batch["inputs"]["attention_mask"].to(device) 
                             batch["labels"] = batch["labels"].to(device)
                             outputs = model(**batch["inputs"])
-                            pred = outputs["logits"].argmax(dim=1)
+                            #pred = outputs["logits"].argmax(dim=1)
+                            pred = outputs.argmax(dim=1)
                             correct += (batch["labels"] == pred).float().sum()
                             count += batch["labels"].shape[0]
                             test_tbar.set_postfix(test_acc=(correct/count).item())
