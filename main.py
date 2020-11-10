@@ -30,11 +30,11 @@ class CollateFn:
 
 def load_ag_news(filepath):
     with open(filepath, newline='', encoding="UTF8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, fieldnames=["class", "title", "description"])
         data = []
         for row in reader:
-            data.append({"label": int(row["Class Index"]) - 1,
-                        "input": row["Title"]})
+            data.append({"label": int(row["class"]) - 1,
+                        "input": row["title"]})
     return data
 
 
@@ -60,7 +60,8 @@ def masked_softmax(vec, mask, dim=1):
     return masked_exps/masked_sums
 
 
-class Roberta(nn.Module):
+class Bert(nn.Module):
+    # For roberta model,
     #def __init__(self, vocab_size=50265, embed_dim=768, padding_idx=1, max_length=514, drop_prob=0.1,
     #             n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12):
     def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
@@ -102,10 +103,12 @@ class Roberta(nn.Module):
     def forward(self, input_ids, attention_mask):
         batch, seq_len = input_ids.shape
         word = self.word_embeddings(input_ids)
+        # For Roberta model,
         #position_ids = torch.arange(self.padding_idx + 1, self.padding_idx + 1 + seq_len,
         #                            device=input_ids.device)
         position_ids = torch.arange(0, seq_len, device=input_ids.device)
         position_ids = position_ids[None, :].expand(batch, -1)
+        # For Roberta model,
         #position_ids = torch.where(attention_mask.bool(), position_ids, torch.ones_like(position_ids))
         position = self.position_embeddings(position_ids)
         token_type_ids = torch.zeros_like(position_ids)
@@ -124,7 +127,6 @@ class Roberta(nn.Module):
         return self.classifier(h[:, 0, :])
 
     def load(self):
-        #model = RobertaModel.from_pretrained("roberta-base")
         model = BertModel.from_pretrained("bert-base-uncased")
         self.word_embeddings.load_state_dict(model.embeddings.word_embeddings.state_dict())
         self.position_embeddings.load_state_dict(model.embeddings.position_embeddings.state_dict())
@@ -141,8 +143,10 @@ class Roberta(nn.Module):
             t["ff_norm"].load_state_dict(f.output.LayerNorm.state_dict())
 
 
-class TMixRoberta(Roberta):
-    def __init__(self, vocab_size=50265, embed_dim=768, padding_idx=1, max_length=514, drop_prob=0.1,
+class TMixBert(Bert):
+    #def __init__(self, vocab_size=50265, embed_dim=768, padding_idx=1, max_length=514, drop_prob=0.1,
+    #             n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0):
+    def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
                  n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0):
         super().__init__(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
                          drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
@@ -180,14 +184,13 @@ if __name__ == "__main__":
     parser.add_argument("--mixup_layer", type=int, default=0)
     args = parser.parse_args()
 
-    train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news", "train.csv"))
-    test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news", "test.csv"))
-
+    train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"))
+    test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"))
 
     #tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-    model = Roberta()
-    #model = TMixRoberta(mixup_layer=args.mixup_layer)
+    #model = Bert()
+    model = TMixBert(mixup_layer=args.mixup_layer)
     model.load()
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=CollateFn(tokenizer))
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
@@ -204,7 +207,7 @@ if __name__ == "__main__":
     step, best_acc = 0, 0
     model.to(device)
     for epoch in range(10):
-        with tqdm(train_loader, desc="Epoch %d" % epoch) as tbar:
+        with tqdm(train_loader, desc="Epoch %d" % epoch, ascii=True) as tbar:
             for batch in tbar:
                 input_ids = batch["inputs"]["input_ids"].to(device) 
                 attention_mask = batch["inputs"]["attention_mask"].to(device) 
@@ -228,7 +231,7 @@ if __name__ == "__main__":
                 if step % 500 == 0:
                     with torch.no_grad():
                         model.eval()
-                        with tqdm(test_loader, desc="Evaluate test") as test_tbar:
+                        with tqdm(test_loader, desc="Evaluate test", ascii=True) as test_tbar:
                             correct, count = 0, 0
                             for batch in test_tbar:
                                 input_ids = batch["inputs"]["input_ids"].to(device) 
