@@ -2,6 +2,7 @@ import os
 import csv
 import math
 import argparse
+import itertools
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,7 +29,7 @@ class CollateFn:
         print("Special token %s: %d" % (self.tokenizer.sep_token, self.tokenizer.sep_token_id))
 
     def __call__(self, batch):
-        inputs = self.tokenizer([x["input"] for x in batch], padding=True, return_tensors="pt")
+        inputs = self.tokenizer([x["input"] for x in batch], padding=True, max_length=256, return_tensors="pt")
         inputs["mixup_mask"] = inputs["attention_mask"] & \
                 (inputs["input_ids"] != self.tokenizer.cls_token_id) & \
                 (inputs["input_ids"] != self.tokenizer.sep_token_id)
@@ -43,6 +44,7 @@ def load_ag_news(filepath):
         for row in reader:
             data.append({"label": int(row["class"]) - 1,
                         "input": row["title"]})
+        print(any(['\\n' in row["input"] for row in data]))
     return data
 
 
@@ -84,20 +86,20 @@ class Bert(nn.Module):
         self.word_embeddings = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
         self.position_embeddings = nn.Embedding(max_length, embed_dim, padding_idx=padding_idx)
         self.token_type_embeddings = nn.Embedding(2, embed_dim)
-        self.embedding_norm = nn.LayerNorm(embed_dim)
+        self.embedding_norm = nn.LayerNorm(embed_dim, eps=1e-12)
         self.encoder = nn.ModuleList([
             nn.ModuleDict({
                 "query": nn.Linear(embed_dim, n_head * k_dim),
                 "key": nn.Linear(embed_dim, n_head * k_dim),
                 "value": nn.Linear(embed_dim, n_head * v_dim),
                 "out": nn.Linear(n_head * v_dim, embed_dim),
-                "norm": nn.LayerNorm(embed_dim),
+                "norm": nn.LayerNorm(embed_dim, eps=1e-12),
                 "ff": nn.Sequential(
                     nn.Linear(embed_dim, feedforward_dim),
                     nn.GELU(),
                     nn.Linear(feedforward_dim, embed_dim),
                 ),
-                "ff_norm": nn.LayerNorm(embed_dim)
+                "ff_norm": nn.LayerNorm(embed_dim, eps=1e-12)
             })
             for _ in range(n_layer)
         ])
@@ -138,7 +140,8 @@ class Bert(nn.Module):
             o = o.view(batch, seq_len, -1)  # [b, h, s, d]
             h = module_dict["norm"](h + self.dropout(module_dict["out"](o)))
             h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
-        return self.classifier(h[:, 0, :])
+        #h = self.pooler(h[:, 0, :])
+        return self.classifier(torch.mean(h, dim=1))
 
     def load(self):
         model = BertModel.from_pretrained("bert-base-uncased")
@@ -170,8 +173,7 @@ class TMixBert(Bert):
     def forward(self, input_ids, attention_mask, mixup_indices=None, alpha=None):
         batch, seq_len = input_ids.shape
         word = self.word_embeddings(input_ids)
-        position_ids = torch.arange(self.padding_idx + 1, self.padding_idx + 1 + seq_len,
-                                    device=input_ids.device)
+        position_ids = torch.arange(0, seq_len, device=input_ids.device)
         position_ids = position_ids[None, :].expand(batch, -1)
         position_ids = torch.where(attention_mask.bool(), position_ids, torch.ones_like(position_ids))
         position = self.position_embeddings(position_ids)
@@ -190,15 +192,14 @@ class TMixBert(Bert):
             o = o.view(batch, seq_len, -1)  # [b, h, s, d]
             h = module_dict["norm"](h + self.dropout(module_dict["out"](o)))
             h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
-        return self.classifier(h[:, 0, :])
+        return self.classifier(torch.mean(h, dim=1))
 
 
 class PdistMixBert(TMixBert):
     def forward(self, input_ids, attention_mask, mixup_indices=None, mixup_mask=None, alpha=None):
         batch, seq_len = input_ids.shape
         word = self.word_embeddings(input_ids)
-        position_ids = torch.arange(self.padding_idx + 1, self.padding_idx + 1 + seq_len,
-                                    device=input_ids.device)
+        position_ids = torch.arange(0, seq_len, device=input_ids.device)
         position_ids = position_ids[None, :].expand(batch, -1)
         position_ids = torch.where(attention_mask.bool(), position_ids, torch.ones_like(position_ids))
         position = self.position_embeddings(position_ids)
@@ -213,10 +214,13 @@ class PdistMixBert(TMixBert):
                     q = q.permute(0, 2, 1, 3)
                     k = k.permute(0, 2, 3, 1)
                     # Challenge. Query vs Key? Query vs Query? Key vs Key?
-                    cross_a = torch.matmul(q, k[mixup_indices]) / math.sqrt(self.k_dim) # [B, H, L, L]
+                    cross_a = torch.matmul(q, k[mixup_indices]) / math.sqrt(self.k_dim) # [B, H, L1, L2]
+                    cross_a = masked_softmax(a, attention_mask[mixup_indices][:, None, None, :], dim=3)
                     # Challenge. Multi-head similarity? mean? max? approx?
-                    cross_sim = torch.max(cross_a, dim=1)[0] # [B, L, L]
-                    mixup_position = masked_argmax(cross_sim, mixup_mask[mixup_indices][:, None, :], dim=2, keepdim=True) # [B, L, 1]
+                    cross_sim = torch.max(cross_a, dim=1)[0] # [B, L1, L2]
+                    mixup_position = masked_argmax(cross_sim, mixup_mask[mixup_indices][:, None, :], dim=2, keepdim=True) # [B, L1, 1]
+                    #print("POSITION")
+                    #print(mixup_position[:, :, 0])
                 h = alpha * h + (1 - alpha) * torch.gather(input=h[mixup_indices],
                                                            dim=1,
                                                            index=mixup_position.expand(-1, -1, h.shape[2]))
@@ -232,7 +236,7 @@ class PdistMixBert(TMixBert):
             o = o.view(batch, seq_len, -1)  # [b, h, s, d]
             h = module_dict["norm"](h + self.dropout(module_dict["out"](o)))
             h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
-        return self.classifier(h[:, 0, :])
+        return self.classifier(torch.mean(h, dim=1))
 
 
 if __name__ == "__main__":
@@ -254,11 +258,16 @@ if __name__ == "__main__":
         model = PdistMixBert(mixup_layer=args.mixup_layer)
 
     model.load()
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=CollateFn(tokenizer))
+    train_loader = DataLoader(train_dataset, batch_size=96, shuffle=True, collate_fn=CollateFn(tokenizer))
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
 
     criterion = nn.CrossEntropyLoss()
-    optimizers = [optim.Adam(model.parameters(), lr=1e-5)]
+    optimizers = [optim.Adam(itertools.chain(model.word_embeddings.parameters(),
+                                             model.position_embeddings.parameters(),
+                                             model.token_type_embeddings.parameters(),
+                                             model.embedding_norm.parameters(),
+                                             model.encoder.parameters()), lr=1e-5),
+                  optim.Adam(model.classifier.parameters(), lr=1e-3)]
     schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
                 for optimizer in optimizers]
 
