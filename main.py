@@ -219,7 +219,7 @@ class PdistMixBert(TMixBert):
                 h2 = torch.gather(input=h[mixup_indices], dim=1, index=mixup_position.expand(-1, -1, h.shape[2]))
                 #h[mixup_mask.bool()] = alpha * h[mixup_mask.bool()] + (1 - alpha) * h2[mixup_mask.bool()]
                 h = alpha * h + (1 - alpha) * h2
-            self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
         return self.classifier(torch.mean(h, dim=1))
 
 
@@ -306,6 +306,10 @@ if __name__ == "__main__":
                 for optimizer in optimizers:
                     optimizer.zero_grad()
                 loss.backward()
+                # Track gradient norm
+                with torch.no_grad():
+                    for k, v in model.named_parameters():
+                        writer.add_scalar("grad/"+k, v.grad.data.norm(2), global_step=step)
                 for optimizer in optimizers:
                     optimizer.step()
                 for scheduler in schedulers:
