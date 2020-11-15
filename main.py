@@ -14,7 +14,7 @@ from transformers import RobertaTokenizer, RobertaForSequenceClassification
 from transformers import RobertaConfig, RobertaModel
 from tqdm import tqdm
 
-torch.set_printoptions(profile="full")
+torch.set_printoptions(profile="full", linewidth=200)
 
 #config = RobertaConfig.from_pretrained("roberta-base")
 config = BertConfig.from_pretrained("bert-base-uncased")
@@ -118,30 +118,34 @@ class Bert(nn.Module):
 
     def forward(self, input_ids, attention_mask):
         batch, seq_len = input_ids.shape
+        h = self._forward_embedding(input_ids, batch, seq_len)
+        for i, module_dict in enumerate(self.encoder):
+            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
+        return self.classifier(torch.mean(h, dim=1))
+
+    def _forward_embedding(self, input_ids, batch, seq_len):
         word = self.word_embeddings(input_ids)
-        # For Roberta model,
-        #position_ids = torch.arange(self.padding_idx + 1, self.padding_idx + 1 + seq_len,
-        #                            device=input_ids.device)
         position_ids = torch.arange(0, seq_len, device=input_ids.device)
         position_ids = position_ids[None, :].expand(batch, -1)
-        # For Roberta model,
-        #position_ids = torch.where(attention_mask.bool(), position_ids, torch.ones_like(position_ids))
         position = self.position_embeddings(position_ids)
         token_type_ids = torch.zeros_like(position_ids)
         token_type = self.token_type_embeddings(token_type_ids)
         h = self.dropout(self.embedding_norm(word + position + token_type))
-        for i, module_dict in enumerate(self.encoder):
-            q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
-            k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
-            v = module_dict["value"](h).view(batch, seq_len, self.n_head, self.v_dim)
-            a = torch.matmul(q.permute(0, 2, 1, 3), k.permute(0, 2, 3, 1)) / math.sqrt(self.k_dim)
-            a = masked_softmax(a, attention_mask[:, None, None, :], dim=3)
-            o = torch.matmul(a, v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3).contiguous()
-            o = o.view(batch, seq_len, -1)  # [b, h, s, d]
-            h = module_dict["norm"](h + self.dropout(module_dict["out"](o)))
-            h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
-        #h = self.pooler(h[:, 0, :])
-        return self.classifier(torch.mean(h, dim=1))
+        return h
+        
+    def _forward_layer(self, h, attention_mask, module_dict, batch, seq_len):
+        q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
+        k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
+        v = module_dict["value"](h).view(batch, seq_len, self.n_head, self.v_dim)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 3, 1)
+        a = torch.matmul(q, k) / math.sqrt(self.k_dim)
+        a = masked_softmax(a, attention_mask[:, None, None, :], dim=3)
+        o = torch.matmul(a, v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3).contiguous()
+        o = o.view(batch, seq_len, -1)  # [b, h, s, d]
+        h = module_dict["norm"](h + self.dropout(module_dict["out"](o)))
+        h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
+        return h
 
     def load(self):
         model = BertModel.from_pretrained("bert-base-uncased")
@@ -172,75 +176,61 @@ class TMixBert(Bert):
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, alpha=None):
         batch, seq_len = input_ids.shape
-        word = self.word_embeddings(input_ids)
-        position_ids = torch.arange(0, seq_len, device=input_ids.device)
-        position_ids = position_ids[None, :].expand(batch, -1)
-        position_ids = torch.where(attention_mask.bool(), position_ids, torch.ones_like(position_ids))
-        position = self.position_embeddings(position_ids)
-        token_type_ids = torch.zeros_like(position_ids)
-        token_type = self.token_type_embeddings(token_type_ids)
-        h = self.dropout(self.embedding_norm(word + position + token_type))
+        with torch.no_grad():
+            h = self._forward_embedding(input_ids, batch, seq_len)
         for i, module_dict in enumerate(self.encoder):
             if i == self.mixup_layer and mixup_indices is not None:
                 h = alpha * h + (1 - alpha) * h[mixup_indices]
-            q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
-            k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
-            v = module_dict["value"](h).view(batch, seq_len, self.n_head, self.v_dim)
-            a = torch.matmul(q.permute(0, 2, 1, 3), k.permute(0, 2, 3, 1)) / math.sqrt(self.k_dim)
-            a = masked_softmax(a, attention_mask[:, None, None, :], dim=3)
-            o = torch.matmul(a, v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3).contiguous()
-            o = o.view(batch, seq_len, -1)  # [b, h, s, d]
-            h = module_dict["norm"](h + self.dropout(module_dict["out"](o)))
-            h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
+            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
         return self.classifier(torch.mean(h, dim=1))
 
 
 class PdistMixBert(TMixBert):
     def forward(self, input_ids, attention_mask, mixup_indices=None, mixup_mask=None, alpha=None):
+        """
+        :param mixup_indices: batch level shuffle index list
+        :type mixup_indices: torch.LongTensor(B)
+        :param mixup_mask: token level mask array. True for normal token False for special token such as pad, cls, sep
+        :type mixup_mask: torch.LongTensor(B, L)
+        """
         batch, seq_len = input_ids.shape
-        word = self.word_embeddings(input_ids)
-        position_ids = torch.arange(0, seq_len, device=input_ids.device)
-        position_ids = position_ids[None, :].expand(batch, -1)
-        position_ids = torch.where(attention_mask.bool(), position_ids, torch.ones_like(position_ids))
-        position = self.position_embeddings(position_ids)
-        token_type_ids = torch.zeros_like(position_ids)
-        token_type = self.token_type_embeddings(token_type_ids)
-        h = self.dropout(self.embedding_norm(word + position + token_type))
+        h = self._forward_embedding(input_ids, batch, seq_len)
         for i, module_dict in enumerate(self.encoder):
             if i == self.mixup_layer and mixup_indices is not None:
                 with torch.no_grad():
+                    mixup_mask = torch.logical_and(mixup_mask[:, :, None], mixup_mask[mixup_indices][:, None, :]) # [B, L1, L2]
+                    mixup_mask = torch.logical_or(mixup_mask, torch.eye(seq_len, device=mixup_mask.device)[None, :, :]) 
+                    #print(mixup_indices)
+                    #print(mixup_mask)
                     q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
                     k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
                     q = q.permute(0, 2, 1, 3)
                     k = k.permute(0, 2, 3, 1)
                     # Challenge. Query vs Key? Query vs Query? Key vs Key?
                     cross_a = torch.matmul(q, k[mixup_indices]) / math.sqrt(self.k_dim) # [B, H, L1, L2]
-                    cross_a = masked_softmax(a, attention_mask[mixup_indices][:, None, None, :], dim=3)
+                    cross_a = masked_softmax(cross_a, attention_mask[mixup_indices][:, None, None, :], dim=3)
                     # Challenge. Multi-head similarity? mean? max? approx?
                     cross_sim = torch.max(cross_a, dim=1)[0] # [B, L1, L2]
-                    mixup_position = masked_argmax(cross_sim, mixup_mask[mixup_indices][:, None, :], dim=2, keepdim=True) # [B, L1, 1]
+                    mixup_position = masked_argmax(cross_sim, mixup_mask, dim=2, keepdim=True) # [B, L1, 1]
+                    #print(mixup_indices)
+                    #print(mixup_mask)
                     #print("POSITION")
                     #print(mixup_position[:, :, 0])
-                h = alpha * h + (1 - alpha) * torch.gather(input=h[mixup_indices],
-                                                           dim=1,
-                                                           index=mixup_position.expand(-1, -1, h.shape[2]))
-
-            q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
-            k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
-            v = module_dict["value"](h).view(batch, seq_len, self.n_head, self.v_dim)
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 3, 1)
-            a = torch.matmul(q, k) / math.sqrt(self.k_dim)
-            a = masked_softmax(a, attention_mask[:, None, None, :], dim=3)
-            o = torch.matmul(a, v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3).contiguous()
-            o = o.view(batch, seq_len, -1)  # [b, h, s, d]
-            h = module_dict["norm"](h + self.dropout(module_dict["out"](o)))
-            h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
+                h2 = torch.gather(input=h[mixup_indices], dim=1, index=mixup_position.expand(-1, -1, h.shape[2]))
+                #h[mixup_mask.bool()] = alpha * h[mixup_mask.bool()] + (1 - alpha) * h2[mixup_mask.bool()]
+                h = alpha * h + (1 - alpha) * h2
+            self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
         return self.classifier(torch.mean(h, dim=1))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # Model hyperparameter
+    parser.add_argument("--restore", type=str)
+    # Train hyperparameter
+    parser.add_argument("--epoch", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=96)
+    # Train hyperparameter - augmentation
     parser.add_argument("--augment", type=str, choices=["none", "tmix", "pdistmix"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=0.5)
@@ -258,7 +248,7 @@ if __name__ == "__main__":
         model = PdistMixBert(mixup_layer=args.mixup_layer)
 
     model.load()
-    train_loader = DataLoader(train_dataset, batch_size=96, shuffle=True, collate_fn=CollateFn(tokenizer))
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=CollateFn(tokenizer))
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
 
     criterion = nn.CrossEntropyLoss()
@@ -275,11 +265,20 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     writer = SummaryWriter()
+
+    if args.restore is not None:
+        checkpoint = torch.load(args.restore)
+        model.load_state_dict(checkpoint["model"])
+        for optimizer, restored_state_dict in zip(optimizers, checkpoints["optimizers"]):
+            optimizer.load_state_dict(restored_state_dict)
+        for scheduler, restored_state_dict in zip(schedulers, checkpoints["schedulers"]):
+            scheduler.load_state_dict(restored_state_dict)
+
     writer.add_hparams(hparam_dict=vars(args), metric_dict={})
     step, best_acc = 0, 0
     model.to(device)
-    for epoch in range(10):
-        with tqdm(train_loader, desc="Epoch %d" % epoch, ascii=True) as tbar:
+    for epoch in range(args.epoch):
+        with tqdm(train_loader, desc="Epoch %d" % epoch, ncols=200) as tbar:
             for batch in tbar:
                 input_ids = batch["inputs"]["input_ids"].to(device) 
                 attention_mask = batch["inputs"]["attention_mask"].to(device) 
@@ -288,14 +287,21 @@ if __name__ == "__main__":
                 else:
                     mixup_mask = None
                 labels = batch["labels"].to(device)
-                mixup_indices = torch.randperm(input_ids.shape[0], device=device)
-                lambda_ = np.random.beta(args.alpha, args.alpha)
-                if lambda_ < 0.5:
-                    lambda_ = 1 - lambda_
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, mixup_mask=mixup_mask, alpha=lambda_)
-                #outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                loss = lambda_ * criterion(outputs, labels) + (1 - lambda_) * criterion(outputs, labels[mixup_indices])
-                tbar.set_postfix(loss="%.4f" % loss.item())
+
+                if args.augment == "none":
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    loss = criterion(outputs, labels)
+                    tbar.set_postfix(loss="%.4f" % loss.item())
+                elif args.augment == "tmix" or args.augment == "pdistmix":
+                    mixup_indices = torch.randperm(input_ids.shape[0], device=device)
+                    lambda_ = np.random.beta(args.alpha, args.alpha)
+                    if lambda_ < 0.5:
+                        lambda_ = 1 - lambda_
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, mixup_mask=mixup_mask, alpha=lambda_)
+                    loss1 = criterion(outputs, labels)
+                    loss2 = criterion(outputs, labels[mixup_indices])
+                    loss = lambda_ * loss1 + (1 - lambda_) * loss2
+                    tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss="%.4f" % loss.item())
                 writer.add_scalar("train_loss", loss, global_step=step)
                 for optimizer in optimizers:
                     optimizer.zero_grad()
@@ -307,14 +313,13 @@ if __name__ == "__main__":
                 if step % 500 == 0:
                     with torch.no_grad():
                         model.eval()
-                        with tqdm(test_loader, desc="Evaluate test", ascii=True) as test_tbar:
+                        with tqdm(test_loader, desc="Evaluate test", ncols=200, leave=True, position=0) as test_tbar:
                             correct, count = 0, 0
                             for batch in test_tbar:
                                 input_ids = batch["inputs"]["input_ids"].to(device) 
                                 attention_mask = batch["inputs"]["attention_mask"].to(device) 
                                 labels = batch["labels"].to(device)
                                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                                #pred = outputs["logits"].argmax(dim=1)
                                 pred = outputs.argmax(dim=1)
                                 correct += (labels == pred).float().sum()
                                 count += labels.shape[0]
@@ -323,6 +328,10 @@ if __name__ == "__main__":
                             writer.add_scalar("test_acc", acc, global_step=step)
                         model.train()
                     if acc > best_acc:
-                        torch.save(model.state_dict(), "model_best.pt")
+                        torch.save({"epoch": epoch,
+                                    "model": model.state_dict(),
+                                    "optimizer": [optimizer.state_dict() for optimizer in optimizers],
+                                    "scheduler": [scheduler.state_dict() for scheduler in schedulers]},
+                                   "checkpoint_best.pt")
                 step += 1
 
