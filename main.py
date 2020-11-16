@@ -1,8 +1,10 @@
 import os
 import csv
 import math
+import pprint
 import argparse
 import itertools
+from collections import Counter
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,7 +16,7 @@ from transformers import RobertaTokenizer, RobertaForSequenceClassification
 from transformers import RobertaConfig, RobertaModel
 from tqdm import tqdm
 
-torch.set_printoptions(profile="full", linewidth=200)
+torch.set_printoptions(profile="full", linewidth=150)
 
 #config = RobertaConfig.from_pretrained("roberta-base")
 config = BertConfig.from_pretrained("bert-base-uncased")
@@ -29,7 +31,7 @@ class CollateFn:
         print("Special token %s: %d" % (self.tokenizer.sep_token, self.tokenizer.sep_token_id))
 
     def __call__(self, batch):
-        inputs = self.tokenizer([x["input"] for x in batch], padding=True, max_length=256, return_tensors="pt")
+        inputs = self.tokenizer([x["input"] for x in batch], padding=True, max_length=512, truncation=True, return_tensors="pt")
         inputs["mixup_mask"] = inputs["attention_mask"] & \
                 (inputs["input_ids"] != self.tokenizer.cls_token_id) & \
                 (inputs["input_ids"] != self.tokenizer.sep_token_id)
@@ -37,26 +39,52 @@ class CollateFn:
                 "labels": torch.tensor([x["label"] for x in batch], dtype=torch.long)}
 
 
-def load_ag_news(filepath):
-    with open(filepath, newline='', encoding="UTF8") as f:
-        reader = csv.DictReader(f, fieldnames=["class", "title", "description"])
-        data = []
-        for row in reader:
-            data.append({"label": int(row["class"]) - 1,
-                        "input": row["title"]})
-        print(any(['\\n' in row["input"] for row in data]))
-    return data
-
-
-class AGNewsDataset(Dataset):
-    def __init__(self, filepath):
-        self.data = load_ag_news(filepath)
-    
+class ListDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
     
     def __len__(self):
         return len(self.data)
+
+
+def read_csv(filepath, fieldnames):
+    with open(filepath, newline='', encoding="UTF8") as f:
+        reader = csv.DictReader(f, fieldnames=fieldnames)
+        for row in reader:
+            yield row
+
+
+def load_ag_news(filepath):
+    data = [{"label": int(row["class"]) - 1, "input": row["title"]}
+            for row in read_csv(filepath, ["class", "title", "description"])]
+    chars = set([ch for row in data for ch in row["input"]])
+    print("Observed characters: ", chars)
+    return data
+
+
+class AGNewsDataset(ListDataset):
+    def __init__(self, filepath):
+        self.data = load_ag_news(filepath)
+        self.n_class = 4
+
+
+def load_amazon_review_full(filepath):
+    data = [{"label": int(row["class"]) - 1, "input": row["text"]}
+            for row in read_csv(filepath, ["class", "title", "text"])]
+    #data = [{"label": int(row["class"]) - 1, "input": row["title"]}
+    #        for row in read_csv(filepath, ["class", "title", "text"])]
+    data = data[:20000]
+    chars = set([ch for row in data for ch in row["input"]])
+    print("Observed characters: ", chars)
+    c = Counter(row["label"] for row in data)
+    print("Number of examples per each class: ", c.most_common())
+    return data
+
+
+class AmazonReviewFullDataset(ListDataset):
+    def __init__(self, filepath):
+        self.data = load_amazon_review_full(filepath)
+        self.n_class = 5
 
 
 def masked_softmax(vec, mask, dim=1):
@@ -65,7 +93,7 @@ def masked_softmax(vec, mask, dim=1):
     exps = torch.exp(masked_vec-max_vec)
     masked_exps = exps * mask.float()
     masked_sums = masked_exps.sum(dim, keepdim=True)
-    zeros=(masked_sums == 0)
+    zeros = (masked_sums == 0)
     masked_sums += zeros.float()
     return masked_exps/masked_sums
 
@@ -81,7 +109,7 @@ class Bert(nn.Module):
     #def __init__(self, vocab_size=50265, embed_dim=768, padding_idx=1, max_length=514, drop_prob=0.1,
     #             n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12):
     def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
-                 n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12):
+                 n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, n_class=4):
         super().__init__()
         self.word_embeddings = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
         self.position_embeddings = nn.Embedding(max_length, embed_dim, padding_idx=padding_idx)
@@ -108,7 +136,7 @@ class Bert(nn.Module):
             nn.Linear(embed_dim, 128),
             nn.Tanh(),
             nn.Dropout(p=drop_prob),
-            nn.Linear(128, 4)
+            nn.Linear(128, n_class)
         )
         self.dropout = nn.Dropout(p=drop_prob)
         self.padding_idx = padding_idx
@@ -168,10 +196,10 @@ class TMixBert(Bert):
     #def __init__(self, vocab_size=50265, embed_dim=768, padding_idx=1, max_length=514, drop_prob=0.1,
     #             n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0):
     def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
-                 n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0):
+                 n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0, n_class=4):
         super().__init__(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
                          drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
-                         feedforward_dim=feedforward_dim, n_layer=n_layer)
+                         feedforward_dim=feedforward_dim, n_layer=n_layer, n_class=n_class)
         self.mixup_layer = mixup_layer
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, alpha=None):
@@ -225,27 +253,34 @@ class PdistMixBert(TMixBert):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # Data hyperparameter
+    parser.add_argument("--dataset", type=str, choices=["ag_news", "amazon_review_full"], default="amazon_review_full")
     # Model hyperparameter
     parser.add_argument("--restore", type=str)
     # Train hyperparameter
     parser.add_argument("--epoch", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=96)
+    parser.add_argument("--lr", type=float, default=2e-5)
     # Train hyperparameter - augmentation
     parser.add_argument("--augment", type=str, choices=["none", "tmix", "pdistmix"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=0)
-    parser.add_argument("--alpha", type=float, default=0.5)
+    parser.add_argument("--alpha", type=float, default=0.2)
     args = parser.parse_args()
 
-    train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"))
-    test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"))
+    if args.dataset == "ag_news":
+        train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"))
+        test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"))
+    elif args.dataset == "amazon_review_full":
+        train_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "train.csv"))
+        test_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "test.csv"))
 
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     if args.augment == "none":
-        model = Bert()
+        model = Bert(n_class=train_dataset.n_class)
     elif args.augment == "tmix":
-        model = TMixBert(mixup_layer=args.mixup_layer)
+        model = TMixBert(n_class=train_dataset.n_class, mixup_layer=args.mixup_layer)
     elif args.augment == "pdistmix":
-        model = PdistMixBert(mixup_layer=args.mixup_layer)
+        model = PdistMixBert(n_class=train_dataset.n_class, mixup_layer=args.mixup_layer)
 
     model.load()
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=CollateFn(tokenizer))
@@ -256,8 +291,8 @@ if __name__ == "__main__":
                                              model.position_embeddings.parameters(),
                                              model.token_type_embeddings.parameters(),
                                              model.embedding_norm.parameters(),
-                                             model.encoder.parameters()), lr=1e-5),
-                  optim.Adam(model.classifier.parameters(), lr=1e-3)]
+                                             model.encoder.parameters()), lr=args.lr),
+                  optim.Adam(model.classifier.parameters(), lr=args.lr)]
     schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
                 for optimizer in optimizers]
 
@@ -278,7 +313,7 @@ if __name__ == "__main__":
     step, best_acc = 0, 0
     model.to(device)
     for epoch in range(args.epoch):
-        with tqdm(train_loader, desc="Epoch %d" % epoch, ncols=200) as tbar:
+        with tqdm(train_loader, desc="Epoch %d" % epoch, ncols=100) as tbar:
             for batch in tbar:
                 input_ids = batch["inputs"]["input_ids"].to(device) 
                 attention_mask = batch["inputs"]["attention_mask"].to(device) 
@@ -314,10 +349,11 @@ if __name__ == "__main__":
                     optimizer.step()
                 for scheduler in schedulers:
                     scheduler.step()
+                step += 1
                 if step % 500 == 0:
                     with torch.no_grad():
                         model.eval()
-                        with tqdm(test_loader, desc="Evaluate test", ncols=200, leave=True, position=0) as test_tbar:
+                        with tqdm(test_loader, desc="Evaluate test", ncols=100, leave=True, position=0) as test_tbar:
                             correct, count = 0, 0
                             for batch in test_tbar:
                                 input_ids = batch["inputs"]["input_ids"].to(device) 
@@ -337,5 +373,4 @@ if __name__ == "__main__":
                                     "optimizer": [optimizer.state_dict() for optimizer in optimizers],
                                     "scheduler": [scheduler.state_dict() for scheduler in schedulers]},
                                    "checkpoint_best.pt")
-                step += 1
 
