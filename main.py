@@ -204,8 +204,7 @@ class TMixBert(Bert):
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, alpha=None):
         batch, seq_len = input_ids.shape
-        with torch.no_grad():
-            h = self._forward_embedding(input_ids, batch, seq_len)
+        h = self._forward_embedding(input_ids, batch, seq_len)
         for i, module_dict in enumerate(self.encoder):
             if i == self.mixup_layer and mixup_indices is not None:
                 h = alpha * h + (1 - alpha) * h[mixup_indices]
@@ -245,6 +244,10 @@ class PdistMixBert(TMixBert):
                     #print("POSITION")
                     #print(mixup_position[:, :, 0])
                 h2 = torch.gather(input=h[mixup_indices], dim=1, index=mixup_position.expand(-1, -1, h.shape[2]))
+                #with torch.no_grad():
+                #    print("absolute difference")
+                #    diff = (h2 * h).sum(dim=2)
+                #    print(torch.min(diff), torch.mean(diff), torch.median(diff), torch.max(diff))
                 #h[mixup_mask.bool()] = alpha * h[mixup_mask.bool()] + (1 - alpha) * h2[mixup_mask.bool()]
                 h = alpha * h + (1 - alpha) * h2
             h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
@@ -332,7 +335,10 @@ if __name__ == "__main__":
                     lambda_ = np.random.beta(args.alpha, args.alpha)
                     if lambda_ < 0.5:
                         lambda_ = 1 - lambda_
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, mixup_mask=mixup_mask, alpha=lambda_)
+                    if args.augment == "tmix":
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, alpha=lambda_)
+                    else:
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, mixup_mask=mixup_mask, alpha=lambda_)
                     loss1 = criterion(outputs, labels)
                     loss2 = criterion(outputs, labels[mixup_indices])
                     loss = lambda_ * loss1 + (1 - lambda_) * loss2
