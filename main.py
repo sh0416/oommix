@@ -6,6 +6,7 @@ import argparse
 import itertools
 from collections import Counter
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -38,9 +39,12 @@ class CollateFn:
                                                             batch_first=True,
                                                             padding_value=self.tokenizer.pad_token_id)
             inputs["attention_mask"] = inputs["input_ids"] != self.tokenizer.pad_token_id
-            inputs["mixup_mask"] = inputs["attention_mask"] & \
-                    (inputs["input_ids"] != self.tokenizer.cls_token_id) & \
-                    (inputs["input_ids"] != self.tokenizer.sep_token_id)
+            inputs["mixup_mask"] = {
+                    "is_cls": (inputs["input_ids"] == self.tokenizer.cls_token_id),
+                    "is_sep": (inputs["input_ids"] == self.tokenizer.sep_token_id),
+                    "is_normal": ((inputs["input_ids"] != self.tokenizer.cls_token_id) & \
+                                  (inputs["input_ids"] != self.tokenizer.sep_token_id) & \
+                                  (inputs["input_ids"] != self.tokenizer.pad_token_id))}
             labels = torch.stack([x["label"] for x in batch])
         return {"inputs": inputs, "labels": labels}
 
@@ -52,7 +56,7 @@ class ListDataset(Dataset):
                 "label": torch.tensor(data["label"], dtype=torch.long)}
     
     def __len__(self):
-        return 20000 # len(self.data)
+        return len(self.data)
 
 
 def load_csv(filepath, fieldnames=None):
@@ -242,10 +246,19 @@ class PdistMixBert(TMixBert):
         for i, module_dict in enumerate(self.encoder):
             if i == self.mixup_layer and mixup_indices is not None:
                 with torch.no_grad():
-                    mixup_mask = torch.logical_and(mixup_mask[:, :, None], mixup_mask[mixup_indices][:, None, :]) # [B, L1, L2]
-                    mixup_mask = torch.logical_or(mixup_mask, torch.eye(seq_len, device=mixup_mask.device)[None, :, :]) 
                     #print(mixup_indices)
                     #print(mixup_mask)
+                    #print(mixup_mask[mixup_indices])
+                    cls_mask = mixup_mask["is_cls"]
+                    cls_mask = torch.logical_and(cls_mask[:, :, None], cls_mask[mixup_indices][:, None, :])
+                    sep_mask = mixup_mask["is_sep"]
+                    sep_mask = torch.logical_and(sep_mask[:, :, None], sep_mask[mixup_indices][:, None, :])
+                    normal_mask = mixup_mask["is_normal"]
+                    normal_mask = torch.logical_and(normal_mask[:, :, None], normal_mask[mixup_indices][:, None, :])
+                    mixup_mask = cls_mask | sep_mask | normal_mask # [B, L1, L2]
+                    with torch.no_grad():
+                        model.mixup_mask = mixup_mask.detach()
+                    #mixup_mask = torch.logical_or(mixup_mask, torch.eye(seq_len, device=mixup_mask.device)[None, :, :]) 
                     q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
                     k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
                     q = q.permute(0, 2, 1, 3)
@@ -255,20 +268,36 @@ class PdistMixBert(TMixBert):
                     cross_a = masked_softmax(cross_a, attention_mask[mixup_indices][:, None, None, :], dim=3)
                     # Challenge. Multi-head similarity? mean? max? approx?
                     cross_sim = torch.max(cross_a, dim=1)[0] # [B, L1, L2]
+                    # Inspect similarity
+                    with torch.no_grad():
+                        self.cross_sim = cross_sim.detach()
                     mixup_position = masked_argmax(cross_sim, mixup_mask, dim=2, keepdim=True) # [B, L1, 1]
-                    #print(mixup_indices)
-                    #print(mixup_mask)
-                    #print("POSITION")
-                    #print(mixup_position[:, :, 0])
+                    with torch.no_grad():
+                        self.mixup_position = mixup_position.detach()
                 h2 = torch.gather(input=h[mixup_indices], dim=1, index=mixup_position.expand(-1, -1, h.shape[2]))
-                #with torch.no_grad():
-                #    print("absolute difference")
-                #    diff = (h2 * h).sum(dim=2)
-                #    print(torch.min(diff), torch.mean(diff), torch.median(diff), torch.max(diff))
-                #h[mixup_mask.bool()] = alpha * h[mixup_mask.bool()] + (1 - alpha) * h2[mixup_mask.bool()]
                 h = alpha * h + (1 - alpha) * h2
             h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
         return self.classifier(torch.mean(h, dim=1))
+
+
+def evaluate(model, loader):
+    with torch.no_grad():
+        model.eval()
+        with tqdm(loader, desc="Evaluate", ncols=100, leave=True, position=0) as test_tbar:
+            correct, count = 0, 0
+            for batch in test_tbar:
+                input_ids = batch["inputs"]["input_ids"].to(device) 
+                attention_mask = batch["inputs"]["attention_mask"].to(device) 
+                labels = batch["labels"].to(device)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                pred = outputs.argmax(dim=1)
+                correct += (labels == pred).float().sum()
+                count += labels.shape[0]
+                test_tbar.set_postfix(test_acc=(correct/count).item())
+            acc = correct / count
+            writer.add_scalar("test_acc", acc, global_step=step)
+        model.train()
+    return acc
 
 
 if __name__ == "__main__":
@@ -290,8 +319,8 @@ if __name__ == "__main__":
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
     if args.dataset == "ag_news":
-        train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"))
-        test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"))
+        train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"), tokenizer)
+        test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"), tokenizer)
     elif args.dataset == "amazon_review_full":
         train_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "train.csv"), tokenizer)
         test_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "test.csv"), tokenizer)
@@ -341,7 +370,10 @@ if __name__ == "__main__":
                     input_ids = batch["inputs"]["input_ids"].to(device) 
                     attention_mask = batch["inputs"]["attention_mask"].to(device) 
                     if "mixup_mask" in batch["inputs"]:
-                        mixup_mask = batch["inputs"]["mixup_mask"].to(device)
+                        mixup_mask = batch["inputs"]["mixup_mask"]
+                        mixup_mask["is_cls"] = mixup_mask["is_cls"].to(device)
+                        mixup_mask["is_sep"] = mixup_mask["is_sep"].to(device)
+                        mixup_mask["is_normal"] = mixup_mask["is_normal"].to(device)
                     else:
                         mixup_mask = None
                     labels = batch["labels"].to(device)
@@ -359,6 +391,19 @@ if __name__ == "__main__":
                             outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, alpha=lambda_)
                         else:
                             outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, mixup_mask=mixup_mask, alpha=lambda_)
+                            if step % 50 == 0:
+                                #print(input_ids)
+                                fig, ax = plt.subplots(figsize=(8, 8))
+                                cross_sim = model.cross_sim[0].cpu().numpy()
+                                im = ax.imshow(cross_sim)
+                                for i in range(cross_sim.shape[0]):
+                                    ax.text(model.mixup_position[0, i], i, 'O', ha='center', va='center', color='w')
+                                writer.add_figure('cross_sim', fig, global_step=step)
+                                fig, ax = plt.subplots(figsize=(8, 8))
+                                mixup_mask = model.mixup_mask[0].cpu().numpy()
+                                im = ax.imshow(mixup_mask)
+                                writer.add_figure('mixup_mask', fig, global_step=step)
+
                         loss1 = criterion(outputs, labels)
                         loss2 = criterion(outputs, labels[mixup_indices])
                         loss = lambda_ * loss1 + (1 - lambda_) * loss2
@@ -378,22 +423,7 @@ if __name__ == "__main__":
                     scheduler.step()
                 step += 1
                 if step % 500 == 0:
-                    with torch.no_grad():
-                        model.eval()
-                        with tqdm(test_loader, desc="Evaluate test", ncols=100, leave=True, position=0) as test_tbar:
-                            correct, count = 0, 0
-                            for batch in test_tbar:
-                                input_ids = batch["inputs"]["input_ids"].to(device) 
-                                attention_mask = batch["inputs"]["attention_mask"].to(device) 
-                                labels = batch["labels"].to(device)
-                                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                                pred = outputs.argmax(dim=1)
-                                correct += (labels == pred).float().sum()
-                                count += labels.shape[0]
-                                test_tbar.set_postfix(test_acc=(correct/count).item())
-                            acc = correct / count
-                            writer.add_scalar("test_acc", acc, global_step=step)
-                        model.train()
+                    acc = evaluate(model, test_loader)
                     if acc > best_acc:
                         torch.save({"epoch": epoch,
                                     "model": model.state_dict(),
