@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import BertModel, BertConfig, BertTokenizer
+from transformers import BertModel, BertConfig, BertTokenizerFast
 from transformers import RobertaTokenizer, RobertaForSequenceClassification
 from transformers import RobertaConfig, RobertaModel
 from tqdm import tqdm
@@ -29,61 +29,81 @@ class CollateFn:
         self.tokenizer = tokenizer
         print("Special token %s: %d" % (self.tokenizer.cls_token, self.tokenizer.cls_token_id))
         print("Special token %s: %d" % (self.tokenizer.sep_token, self.tokenizer.sep_token_id))
+        print("Special token %s: %d" % (self.tokenizer.pad_token, self.tokenizer.pad_token_id))
 
     def __call__(self, batch):
-        inputs = self.tokenizer([x["input"] for x in batch], padding=True, max_length=512, truncation=True, return_tensors="pt")
-        inputs["mixup_mask"] = inputs["attention_mask"] & \
-                (inputs["input_ids"] != self.tokenizer.cls_token_id) & \
-                (inputs["input_ids"] != self.tokenizer.sep_token_id)
-        return {"inputs": inputs,
-                "labels": torch.tensor([x["label"] for x in batch], dtype=torch.long)}
+        inputs = {}
+        with torch.no_grad():
+            inputs["input_ids"] = nn.utils.rnn.pad_sequence([x["input"] for x in batch],
+                                                            batch_first=True,
+                                                            padding_value=self.tokenizer.pad_token_id)
+            inputs["attention_mask"] = inputs["input_ids"] != self.tokenizer.pad_token_id
+            inputs["mixup_mask"] = inputs["attention_mask"] & \
+                    (inputs["input_ids"] != self.tokenizer.cls_token_id) & \
+                    (inputs["input_ids"] != self.tokenizer.sep_token_id)
+            labels = torch.stack([x["label"] for x in batch])
+        return {"inputs": inputs, "labels": labels}
 
 
 class ListDataset(Dataset):
     def __getitem__(self, idx):
-        return self.data[idx]
+        data = self.data[idx]
+        return {"input": torch.tensor(data["input"], dtype=torch.long),
+                "label": torch.tensor(data["label"], dtype=torch.long)}
     
     def __len__(self):
-        return len(self.data)
+        return 20000 # len(self.data)
 
 
-def read_csv(filepath, fieldnames):
+def load_csv(filepath, fieldnames=None):
     with open(filepath, newline='', encoding="UTF8") as f:
         reader = csv.DictReader(f, fieldnames=fieldnames)
         for row in reader:
             yield row
 
 
+def save_csv(filepath, data, fieldnames): 
+    with open(filepath, 'w', newline='', encoding='UTF8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in data:
+            writer.writerow(row)
+
+
 def load_ag_news(filepath):
     data = [{"label": int(row["class"]) - 1, "input": row["title"]}
-            for row in read_csv(filepath, ["class", "title", "description"])]
+            for row in load_csv(filepath, ["class", "title", "description"])]
     chars = set([ch for row in data for ch in row["input"]])
     print("Observed characters: ", chars)
     return data
 
 
 class AGNewsDataset(ListDataset):
-    def __init__(self, filepath):
+    def __init__(self, filepath, tokenizer):
         self.data = load_ag_news(filepath)
         self.n_class = 4
 
 
-def load_amazon_review_full(filepath):
-    data = [{"label": int(row["class"]) - 1, "input": row["text"]}
-            for row in read_csv(filepath, ["class", "title", "text"])]
-    #data = [{"label": int(row["class"]) - 1, "input": row["title"]}
-    #        for row in read_csv(filepath, ["class", "title", "text"])]
-    data = data[:20000]
-    chars = set([ch for row in data for ch in row["input"]])
-    print("Observed characters: ", chars)
-    c = Counter(row["label"] for row in data)
-    print("Number of examples per each class: ", c.most_common())
+def load_amazon_review_full(filepath, tokenizer):
+    cached_filepath = os.path.join('cache', filepath)
+    if not os.path.exists(cached_filepath):
+        data = [{"label": int(row["class"]) - 1, "input": row["text"]}
+                for row in tqdm(load_csv(filepath, ["class", "title", "text"]), desc="Load amazon dataset")]
+        data = data[:20000]
+        for row in tqdm(data, desc="Tokenize amazon text"):
+            row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=512, truncation=True)["input_ids"]))
+        os.makedirs(os.path.dirname(cached_filepath), exist_ok=True)
+        save_csv(cached_filepath, data, ["input", "label"])
+    data = list(load_csv(cached_filepath))
+    for row in data:
+        row["input"] = list(map(int, row["input"].split(' ')))
+        row["label"] = int(row["label"])
     return data
 
 
 class AmazonReviewFullDataset(ListDataset):
-    def __init__(self, filepath):
-        self.data = load_amazon_review_full(filepath)
+    def __init__(self, filepath, tokenizer):
+        self.data = load_amazon_review_full(filepath, tokenizer)
         self.n_class = 5
 
 
@@ -270,14 +290,15 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", type=float, default=0.2)
     args = parser.parse_args()
 
+    tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+
     if args.dataset == "ag_news":
         train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"))
         test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"))
     elif args.dataset == "amazon_review_full":
-        train_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "train.csv"))
-        test_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "test.csv"))
+        train_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "train.csv"), tokenizer)
+        test_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "test.csv"), tokenizer)
 
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     if args.augment == "none":
         model = Bert(n_class=train_dataset.n_class)
     elif args.augment == "tmix":
@@ -298,6 +319,7 @@ if __name__ == "__main__":
                   optim.Adam(model.classifier.parameters(), lr=args.lr)]
     schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
                 for optimizer in optimizers]
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
 
     print("CUDA: %d" % torch.cuda.is_available())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -318,41 +340,43 @@ if __name__ == "__main__":
     for epoch in range(args.epoch):
         with tqdm(train_loader, desc="Epoch %d" % epoch, ncols=100) as tbar:
             for batch in tbar:
-                input_ids = batch["inputs"]["input_ids"].to(device) 
-                attention_mask = batch["inputs"]["attention_mask"].to(device) 
-                if "mixup_mask" in batch["inputs"]:
-                    mixup_mask = batch["inputs"]["mixup_mask"].to(device)
-                else:
-                    mixup_mask = None
-                labels = batch["labels"].to(device)
-
-                if args.augment == "none":
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss = criterion(outputs, labels)
-                    tbar.set_postfix(loss="%.4f" % loss.item())
-                elif args.augment == "tmix" or args.augment == "pdistmix":
-                    mixup_indices = torch.randperm(input_ids.shape[0], device=device)
-                    lambda_ = np.random.beta(args.alpha, args.alpha)
-                    if lambda_ < 0.5:
-                        lambda_ = 1 - lambda_
-                    if args.augment == "tmix":
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, alpha=lambda_)
+                with torch.cuda.amp.autocast(enabled=True):
+                    input_ids = batch["inputs"]["input_ids"].to(device) 
+                    attention_mask = batch["inputs"]["attention_mask"].to(device) 
+                    if "mixup_mask" in batch["inputs"]:
+                        mixup_mask = batch["inputs"]["mixup_mask"].to(device)
                     else:
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, mixup_mask=mixup_mask, alpha=lambda_)
-                    loss1 = criterion(outputs, labels)
-                    loss2 = criterion(outputs, labels[mixup_indices])
-                    loss = lambda_ * loss1 + (1 - lambda_) * loss2
-                    tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss="%.4f" % loss.item())
+                        mixup_mask = None
+                    labels = batch["labels"].to(device)
+
+                    if args.augment == "none":
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                        loss = criterion(outputs, labels)
+                        #tbar.set_postfix(loss="%.4f" % loss.item())
+                    elif args.augment == "tmix" or args.augment == "pdistmix":
+                        mixup_indices = torch.randperm(input_ids.shape[0], device=device)
+                        lambda_ = np.random.beta(args.alpha, args.alpha)
+                        if lambda_ < 0.5:
+                            lambda_ = 1 - lambda_
+                        if args.augment == "tmix":
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, alpha=lambda_)
+                        else:
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, mixup_mask=mixup_mask, alpha=lambda_)
+                        loss1 = criterion(outputs, labels)
+                        loss2 = criterion(outputs, labels[mixup_indices])
+                        loss = lambda_ * loss1 + (1 - lambda_) * loss2
+                        #tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss="%.4f" % loss.item())
                 writer.add_scalar("train_loss", loss, global_step=step)
                 for optimizer in optimizers:
                     optimizer.zero_grad()
-                loss.backward()
+                scaler.scale(loss).backward()
                 # Track gradient norm
-                with torch.no_grad():
-                    for k, v in model.named_parameters():
-                        writer.add_scalar("grad/"+k, v.grad.data.norm(2), global_step=step)
+                #with torch.no_grad():
+                #    for k, v in model.named_parameters():
+                #        writer.add_scalar("grad/"+k, v.grad.data.norm(2), global_step=step)
                 for optimizer in optimizers:
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                 for scheduler in schedulers:
                     scheduler.step()
                 step += 1
