@@ -6,7 +6,6 @@ import argparse
 import itertools
 from collections import Counter
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,6 +16,9 @@ from transformers import RobertaTokenizer, RobertaForSequenceClassification
 from transformers import RobertaConfig, RobertaModel
 from tqdm import tqdm
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 torch.set_printoptions(profile="full", linewidth=150)
 
 #config = RobertaConfig.from_pretrained("roberta-base")
