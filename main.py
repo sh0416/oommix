@@ -70,40 +70,42 @@ def save_csv(filepath, data, fieldnames):
             writer.writerow(row)
 
 
-def load_ag_news(filepath):
-    data = [{"label": int(row["class"]) - 1, "input": row["title"]}
-            for row in load_csv(filepath, ["class", "title", "description"])]
-    chars = set([ch for row in data for ch in row["input"]])
-    print("Observed characters: ", chars)
-    return data
-
-
-class AGNewsDataset(ListDataset):
-    def __init__(self, filepath, tokenizer):
-        self.data = load_ag_news(filepath)
-        self.n_class = 4
-
-
-def load_amazon_review_full(filepath, tokenizer):
+def preprocess(f, filepath, tokenizer):
     cached_filepath = os.path.join('cache', filepath)
     if not os.path.exists(cached_filepath):
-        data = [{"label": int(row["class"]) - 1, "input": row["text"]}
-                for row in tqdm(load_csv(filepath, ["class", "title", "text"]), desc="Load amazon dataset")]
-        data = data[:20000]
+        data = f(filepath)
         for row in tqdm(data, desc="Tokenize amazon text"):
             row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=512, truncation=True)["input_ids"]))
         os.makedirs(os.path.dirname(cached_filepath), exist_ok=True)
         save_csv(cached_filepath, data, ["input", "label"])
     data = list(load_csv(cached_filepath))
-    for row in data:
-        row["input"] = list(map(int, row["input"].split(' ')))
-        row["label"] = int(row["label"])
+    data = [{"input": list(map(int, row["input"].split(' '))), "label": int(row["label"])}
+            for row in data]
+    return data
+
+
+def load_ag_news(filepath):
+    data = [{"label": int(row["class"]) - 1, "input": row["title"]}
+            for row in tqdm(load_csv(filepath, ["class", "title", "description"]), desc="Load ag news dataset")]
+    return data
+
+
+class AGNewsDataset(ListDataset):
+    def __init__(self, filepath, tokenizer):
+        self.data = preprocess(load_ag_news, filepath, tokenizer)
+        self.n_class = 4
+
+
+def load_amazon_review_full(filepath):
+    data = [{"label": int(row["class"]) - 1, "input": row["text"]}
+            for row in tqdm(load_csv(filepath, ["class", "title", "text"]), desc="Load amazon dataset")]
+    data = data[:20000]
     return data
 
 
 class AmazonReviewFullDataset(ListDataset):
     def __init__(self, filepath, tokenizer):
-        self.data = load_amazon_review_full(filepath, tokenizer)
+        self.data = preprocess(load_amazon_review_full, filepath, tokenizer)
         self.n_class = 5
 
 
@@ -125,9 +127,6 @@ def masked_argmax(vec, mask, dim, keepdim=False):
 
 
 class Bert(nn.Module):
-    # For roberta model,
-    #def __init__(self, vocab_size=50265, embed_dim=768, padding_idx=1, max_length=514, drop_prob=0.1,
-    #             n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12):
     def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
                  n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, n_class=4):
         super().__init__()
@@ -213,8 +212,6 @@ class Bert(nn.Module):
 
 
 class TMixBert(Bert):
-    #def __init__(self, vocab_size=50265, embed_dim=768, padding_idx=1, max_length=514, drop_prob=0.1,
-    #             n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0):
     def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
                  n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0, n_class=4):
         super().__init__(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
