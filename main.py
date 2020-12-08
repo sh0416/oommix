@@ -115,6 +115,18 @@ class AmazonReviewFullDataset(ListDataset):
         self.n_class = 5
 
 
+def load_yelp_polarity(filepath):
+    data = [{"label": int(row["class"]) - 1, "input": row["review"]}
+            for row in tqdm(load_csv(filepath, ["class", "review"]), desc="Load yelp polarity")]
+    return data
+
+
+class YelpPolarityDataset(ListDataset):
+    def __init__(self, filepath, tokenizer):
+        self.data = preprocess(load_yelp_polarity, filepath, tokenizer)
+        self.n_class = 2
+
+
 def masked_softmax(vec, mask, dim=1):
     masked_vec = vec * mask.float()
     max_vec = torch.max(masked_vec, dim=dim, keepdim=True)[0]
@@ -176,6 +188,9 @@ class Bert(nn.Module):
             h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
         return self.classifier(torch.mean(h, dim=1))
 
+    def predict(self, input_ids, attention_mask):
+        return self.forward(input_ids, attention_mask)
+
     def _forward_embedding(self, input_ids, batch, seq_len):
         word = self.word_embeddings(input_ids)
         position_ids = torch.arange(0, seq_len, device=input_ids.device)
@@ -235,6 +250,48 @@ class TMixBert(Bert):
         return self.classifier(torch.mean(h, dim=1))
 
 
+class AdaMixBert(Bert):
+    def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
+                 n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0, n_class=4):
+        super().__init__(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
+                         drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
+                         feedforward_dim=feedforward_dim, n_layer=n_layer, n_class=n_class)
+        self.mixup_layer = mixup_layer
+        self.policy_region_generator = nn.Sequential(
+            nn.Linear(2*embed_dim, 3),
+            nn.Softmax(dim=1)
+        )
+        self.intrusion_classifier = nn.Linear(embed_dim, 1)
+
+    def forward(self, input_ids, attention_mask, mixup_indices):
+        batch, seq_len = input_ids.shape
+        h = self._forward_embedding(input_ids, batch, seq_len)
+
+        # Policy Regien Generator
+        for module_dict in self.encoder[:self.mixup_layer]:
+            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
+        sentence_h = h.mean(dim=1)
+        policy_region = self.policy_region_generator(torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1))  # [B, 3]
+        eps = torch.rand(policy_region.shape[0], device=policy_region.device)
+        gamma = policy_region[:, 1] * eps + policy_region[:, 0]
+        mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
+
+        # Classifier
+        for module_dict in self.encoder[self.mixup_layer:]:
+            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            mix_h = self._forward_layer(mix_h, attention_mask, module_dict, batch, seq_len)
+        h, mix_h = torch.mean(h, dim=1), torch.mean(mix_h, dim=1)
+        out, mix_out = self.classifier(h), self.classifier(mix_h)
+
+        # Intrusion Discriminator
+        intr = self.intrusion_classifier(h)
+        mix_intr = self.intrusion_classifier(mix_h)
+        return out, mix_out, intr, mix_intr, gamma
+
+    def predict(self, input_ids, attention_mask):
+        return super().forward(input_ids=input_ids, attention_mask=attention_mask)
+
+
 class PdistMixBert(TMixBert):
     def forward(self, input_ids, attention_mask, mixup_indices=None, mixup_mask=None, alpha=None):
         """
@@ -248,9 +305,6 @@ class PdistMixBert(TMixBert):
         for i, module_dict in enumerate(self.encoder):
             if i == self.mixup_layer and mixup_indices is not None:
                 with torch.no_grad():
-                    #print(mixup_indices)
-                    #print(mixup_mask)
-                    #print(mixup_mask[mixup_indices])
                     cls_mask = mixup_mask["is_cls"]
                     cls_mask = torch.logical_and(cls_mask[:, :, None], cls_mask[mixup_indices][:, None, :])
                     sep_mask = mixup_mask["is_sep"]
@@ -260,7 +314,6 @@ class PdistMixBert(TMixBert):
                     mixup_mask = cls_mask | sep_mask | normal_mask # [B, L1, L2]
                     with torch.no_grad():
                         model.mixup_mask = mixup_mask.detach()
-                    #mixup_mask = torch.logical_or(mixup_mask, torch.eye(seq_len, device=mixup_mask.device)[None, :, :]) 
                     q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
                     k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
                     q = q.permute(0, 2, 1, 3)
@@ -291,7 +344,7 @@ def evaluate(model, loader):
                 input_ids = batch["inputs"]["input_ids"].to(device) 
                 attention_mask = batch["inputs"]["attention_mask"].to(device) 
                 labels = batch["labels"].to(device)
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                outputs = model.predict(input_ids=input_ids, attention_mask=attention_mask)
                 pred = outputs.argmax(dim=1)
                 correct += (labels == pred).float().sum()
                 count += labels.shape[0]
@@ -305,7 +358,7 @@ def evaluate(model, loader):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Data hyperparameter
-    parser.add_argument("--dataset", type=str, choices=["ag_news", "amazon_review_full"], default="amazon_review_full")
+    parser.add_argument("--dataset", type=str, choices=["ag_news", "amazon_review_full", "yelp_polarity"], default="amazon_review_full")
     # Model hyperparameter
     parser.add_argument("--restore", type=str)
     # Train hyperparameter
@@ -313,8 +366,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=96)
     parser.add_argument("--lr", type=float, default=2e-5)
     # Train hyperparameter - augmentation
-    parser.add_argument("--augment", type=str, choices=["none", "tmix", "pdistmix"], default="none")
-    parser.add_argument("--mixup_layer", type=int, default=0)
+    parser.add_argument("--augment", type=str, choices=["none", "tmix", "adamix", "pdistmix"], default="none")
+    parser.add_argument("--mixup_layer", type=int, default=3)
     parser.add_argument("--alpha", type=float, default=0.2)
     args = parser.parse_args()
 
@@ -326,11 +379,16 @@ if __name__ == "__main__":
     elif args.dataset == "amazon_review_full":
         train_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "train.csv"), tokenizer)
         test_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "test.csv"), tokenizer)
+    elif args.dataset == "yelp_polarity":
+        train_dataset = YelpPolarityDataset(os.path.join("dataset", "yelp_review_polarity_csv", "train.csv"), tokenizer)
+        test_dataset = YelpPolarityDataset(os.path.join("dataset", "yelp_review_polarity_csv", "test.csv"), tokenizer)
 
     if args.augment == "none":
         model = Bert(n_class=train_dataset.n_class)
     elif args.augment == "tmix":
         model = TMixBert(n_class=train_dataset.n_class, mixup_layer=args.mixup_layer)
+    elif args.augment == "adamix":
+        model = AdaMixBert(n_class=train_dataset.n_class, mixup_layer=args.mixup_layer)
     elif args.augment == "pdistmix":
         model = PdistMixBert(n_class=train_dataset.n_class, mixup_layer=args.mixup_layer)
 
@@ -338,14 +396,18 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=CollateFn(tokenizer))
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
 
-    criterion = nn.CrossEntropyLoss()
-    optimizers = [optim.Adam(itertools.chain(model.word_embeddings.parameters(),
+    if args.augment == "adamix":
+        criterion = nn.CrossEntropyLoss(reduction='none')
+    else:
+        criterion = nn.CrossEntropyLoss()
+    criterion2 = nn.BCEWithLogitsLoss()
+    optimizers = [optim.AdamW(itertools.chain(model.word_embeddings.parameters(),
                                              model.position_embeddings.parameters(),
                                              model.token_type_embeddings.parameters(),
                                              model.embedding_norm.parameters(),
                                              model.encoder.parameters()), lr=args.lr),
-                  optim.Adam(model.classifier.parameters(), lr=args.lr)]
-    schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
+                  optim.AdamW(model.classifier.parameters(), lr=args.lr)]
+    schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, max(-(x-20000)/(20000-1000), 0)))
                 for optimizer in optimizers]
     scaler = torch.cuda.amp.GradScaler(enabled=True)
 
@@ -366,7 +428,7 @@ if __name__ == "__main__":
     step, best_acc = 0, 0
     model.to(device)
     for epoch in range(args.epoch):
-        with tqdm(train_loader, desc="Epoch %d" % epoch, ncols=100) as tbar:
+        with tqdm(train_loader, desc="Epoch %d" % epoch, ncols=200) as tbar:
             for batch in tbar:
                 with torch.cuda.amp.autocast(enabled=True):
                     input_ids = batch["inputs"]["input_ids"].to(device) 
@@ -409,7 +471,16 @@ if __name__ == "__main__":
                         loss1 = criterion(outputs, labels)
                         loss2 = criterion(outputs, labels[mixup_indices])
                         loss = lambda_ * loss1 + (1 - lambda_) * loss2
-                        #tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss="%.4f" % loss.item())
+                        tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss="%.4f" % loss.item())
+                    elif args.augment == "adamix":
+                        mixup_indices = torch.randperm(input_ids.shape[0], device=device)
+                        outs, mix_outs, intr, mix_intr, gamma = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices)
+                        loss1 = criterion(outs, labels).mean()
+                        loss2 = (gamma * criterion(mix_outs, labels) + (1 - gamma) * criterion(mix_outs, labels[mixup_indices])).mean()
+                        loss3 = criterion2(torch.cat((intr, mix_intr), dim=0),
+                                           torch.cat((torch.zeros_like(intr), torch.ones_like(mix_intr)), dim=0))
+                        loss = loss1 + loss2 + 7*loss3
+                        tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss3="%.4f" % loss3, loss="%.4f" % loss, gamma="%.4f" % gamma.mean())
                 writer.add_scalar("train_loss", loss, global_step=step)
                 for optimizer in optimizers:
                     optimizer.zero_grad()
