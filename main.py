@@ -97,9 +97,11 @@ def load_ag_news(filepath):
 
 
 class AGNewsDataset(ListDataset):
-    def __init__(self, filepath, tokenizer):
+    def __init__(self, filepath, tokenizer, data_size):
         self.data = preprocess(load_ag_news, filepath, tokenizer)
         self.n_class = 4
+        if data_size != -1:
+            self.data = self.data[:min(data_size, len(self.data))]
 
 
 def load_amazon_review_full(filepath):
@@ -168,30 +170,21 @@ class Bert(nn.Module):
             })
             for _ in range(n_layer)
         ])
-        self.classifier = nn.Sequential(
-            nn.Dropout(p=drop_prob),
-            nn.Linear(embed_dim, 128),
-            nn.Tanh(),
-            nn.Dropout(p=drop_prob),
-            nn.Linear(128, n_class)
-        )
         self.dropout = nn.Dropout(p=drop_prob)
         self.padding_idx = padding_idx
         self.n_head = n_head
         self.k_dim = k_dim
         self.v_dim = v_dim
+        self.embed_dim = embed_dim
 
     def forward(self, input_ids, attention_mask):
         batch, seq_len = input_ids.shape
-        h = self._forward_embedding(input_ids, batch, seq_len)
+        h = self.forward_embedding(input_ids, batch, seq_len)
         for i, module_dict in enumerate(self.encoder):
-            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
-        return self.classifier(torch.mean(h, dim=1))
+            h = self.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+        return h
 
-    def predict(self, input_ids, attention_mask):
-        return self.forward(input_ids, attention_mask)
-
-    def _forward_embedding(self, input_ids, batch, seq_len):
+    def forward_embedding(self, input_ids, batch, seq_len):
         word = self.word_embeddings(input_ids)
         position_ids = torch.arange(0, seq_len, device=input_ids.device)
         position_ids = position_ids[None, :].expand(batch, -1)
@@ -201,7 +194,7 @@ class Bert(nn.Module):
         h = self.dropout(self.embedding_norm(word + position + token_type))
         return h
         
-    def _forward_layer(self, h, attention_mask, module_dict, batch, seq_len):
+    def forward_layer(self, h, attention_mask, module_dict, batch, seq_len):
         q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
         k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
         v = module_dict["value"](h).view(batch, seq_len, self.n_head, self.v_dim)
@@ -232,67 +225,154 @@ class Bert(nn.Module):
             t["ff_norm"].load_state_dict(f.output.LayerNorm.state_dict())
 
 
-class TMixBert(Bert):
-    def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
-                 n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0, n_class=4):
-        super().__init__(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
-                         drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
-                         feedforward_dim=feedforward_dim, n_layer=n_layer, n_class=n_class)
+class TMix(nn.Module):
+    def __init__(self, embedding_model, mixup_layer=0):
+        super().__init__()
+        self.embedding_model = embedding_model
         self.mixup_layer = mixup_layer
 
-    def forward(self, input_ids, attention_mask, mixup_indices=None, alpha=None):
+    def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
         batch, seq_len = input_ids.shape
-        h = self._forward_embedding(input_ids, batch, seq_len)
-        for i, module_dict in enumerate(self.encoder):
-            if i == self.mixup_layer and mixup_indices is not None:
-                h = alpha * h + (1 - alpha) * h[mixup_indices]
-            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
-        return self.classifier(torch.mean(h, dim=1))
+        h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
+        for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+        if mixup_indices is not None:
+            h = lambda_ * h + (1 - lambda_) * h[mixup_indices]
+        for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+        return h
 
 
-class AdaMixBert(Bert):
-    def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
-                 n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=0, n_class=4):
-        super().__init__(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
-                         drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
-                         feedforward_dim=feedforward_dim, n_layer=n_layer, n_class=n_class)
-        self.mixup_layer = mixup_layer
+class AdaMix(nn.Module):
+    def __init__(self, embedding_model, mixup_layer=0):
+        super().__init__()
+        self.embedding_model = embedding_model
         self.policy_region_generator = nn.Sequential(
-            nn.Linear(2*embed_dim, 3),
-            nn.Softmax(dim=1)
-        )
-        self.intrusion_classifier = nn.Linear(embed_dim, 1)
+            nn.Linear(2*self.embedding_model.embed_dim, 3),
+            nn.Softmax(dim=1))
+        self.intrusion_classifier = nn.Linear(self.embedding_model.embed_dim, 1)
+        self.mixup_layer = mixup_layer
 
-    def forward(self, input_ids, attention_mask, mixup_indices):
+    def forward(self, input_ids, attention_mask, mixup_indices=None):
         batch, seq_len = input_ids.shape
-        h = self._forward_embedding(input_ids, batch, seq_len)
+        h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
 
-        # Policy Regien Generator
-        for module_dict in self.encoder[:self.mixup_layer]:
-            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
-        sentence_h = h.mean(dim=1)
-        policy_region = self.policy_region_generator(torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1))  # [B, 3]
-        eps = torch.rand(policy_region.shape[0], device=policy_region.device)
-        gamma = policy_region[:, 1] * eps + policy_region[:, 0]
-        mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
+        for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+
+        if mixup_indices is not None:
+            # Policy Region Generator
+            sentence_h = h.mean(dim=1)
+            policy_region = self.policy_region_generator(torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1))  # [B, 3]
+            eps = torch.rand(policy_region.shape[0], device=policy_region.device)
+            gamma = policy_region[:, 1] * eps + policy_region[:, 0]
+            mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
+
+        for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            if mixup_indices is not None:
+                mix_h = self.embedding_model.forward_layer(mix_h, attention_mask, module_dict, batch, seq_len)
 
         # Classifier
-        for module_dict in self.encoder[self.mixup_layer:]:
-            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
-            mix_h = self._forward_layer(mix_h, attention_mask, module_dict, batch, seq_len)
-        h, mix_h = torch.mean(h, dim=1), torch.mean(mix_h, dim=1)
-        out, mix_out = self.classifier(h), self.classifier(mix_h)
-
-        # Intrusion Discriminator
-        intr = self.intrusion_classifier(h)
-        mix_intr = self.intrusion_classifier(mix_h)
-        return out, mix_out, intr, mix_intr, gamma
+        if mixup_indices is None:
+            return h
+        else:
+            # Intrusion Discriminator
+            intr = self.intrusion_classifier(h)
+            mix_intr = self.intrusion_classifier(mix_h)
+            return h, mix_h, intr, mix_intr, gamma
 
     def predict(self, input_ids, attention_mask):
         return super().forward(input_ids=input_ids, attention_mask=attention_mask)
 
 
-class PdistMixBert(TMixBert):
+class SentenceClassificationModel(nn.Module):
+    def __init__(self, embedding_model, n_class):
+        super().__init__()
+        self.embedding_model = embedding_model
+        self.classifier = nn.Sequential(
+            nn.Linear(self.embedding_model.embed_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, n_class)
+        )
+
+    def forward(self, input_ids, attention_mask):
+        h = self.embedding_model(input_ids, attention_mask)
+        return self.classifier(torch.mean(h, dim=1))
+
+    def load(self):
+        self.embedding_model.load()
+
+
+class TMixSentenceClassificationModel(nn.Module):
+    def __init__(self, mix_model, n_class):
+        super().__init__()
+        self.mix_model = mix_model
+        self.classifier = nn.Sequential(
+            nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, n_class)
+        )
+
+    def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
+        h = self.mix_model(input_ids, attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
+        return self.classifier(torch.mean(h, dim=1))
+
+    def load(self):
+        self.mix_model.embedding_model.load()
+
+
+class AdaMixSentenceClassificationModel(nn.Module):
+    def __init__(self, mix_model, n_class):
+        super().__init__()
+        self.mix_model = mix_model
+        self.classifier = nn.Sequential(
+            nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, n_class)
+        )
+
+    def forward(self, input_ids, attention_mask, mixup_indices=None):
+        if mixup_indices is None:
+            h = self.mix_model(input_ids, attention_mask)
+            return self.classifier(torch.mean(h, dim=1))
+        else:
+            h, mix_h, intr, mix_intr, gamma = self.mix_model(input_ids, attention_mask, mixup_indices)
+            out = self.classifier(torch.mean(h, dim=1))
+            mix_out = self.classifier(torch.mean(mix_h, dim=1))
+            return out, mix_out, intr, mix_intr, gamma
+        
+    def load(self):
+        self.mix_model.embedding_model.load()
+
+
+def create_bert_sentence_classification_model(vocab_size=30522, embed_dim=768, padding_idx=0,
+        drop_prob=0.1, n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, n_class=4):
+    embedding_model = Bert(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
+                           drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
+                           feedforward_dim=feedforward_dim, n_layer=n_layer)
+    return SentenceClassificationModel(embedding_model, n_class)
+
+
+def create_tmix_bert_sentence_classification_model(vocab_size=30522, embed_dim=768, padding_idx=0,
+        drop_prob=0.1, n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=3, n_class=4):
+    embedding_model = Bert(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
+                           drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
+                           feedforward_dim=feedforward_dim, n_layer=n_layer)
+    embedding_model = TMix(embedding_model, mixup_layer=mixup_layer)
+    return TMixSentenceClassificationModel(embedding_model, n_class)
+
+
+def create_adamix_bert_sentence_classification_model(vocab_size=30522, embed_dim=768, padding_idx=0,
+        drop_prob=0.1, n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, mixup_layer=3, n_class=4):
+    embedding_model = Bert(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
+                           drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
+                           feedforward_dim=feedforward_dim, n_layer=n_layer)
+    embedding_model = AdaMix(embedding_model, mixup_layer=mixup_layer)
+    return AdaMixSentenceClassificationModel(embedding_model, n_class)
+
+
+class PdistMixBert(TMix):
     def forward(self, input_ids, attention_mask, mixup_indices=None, mixup_mask=None, alpha=None):
         """
         :param mixup_indices: batch level shuffle index list
@@ -335,20 +415,20 @@ class PdistMixBert(TMixBert):
         return self.classifier(torch.mean(h, dim=1))
 
 
-def evaluate(model, loader):
+def evaluate(model, loader, step):
     with torch.no_grad():
         model.eval()
-        with tqdm(loader, desc="Evaluate", ncols=100, leave=True, position=0) as test_tbar:
+        with tqdm(loader, desc="Evaluate", ncols=200, leave=True, position=0) as test_tbar:
             correct, count = 0, 0
             for batch in test_tbar:
                 input_ids = batch["inputs"]["input_ids"].to(device) 
                 attention_mask = batch["inputs"]["attention_mask"].to(device) 
                 labels = batch["labels"].to(device)
-                outputs = model.predict(input_ids=input_ids, attention_mask=attention_mask)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 pred = outputs.argmax(dim=1)
                 correct += (labels == pred).float().sum()
                 count += labels.shape[0]
-                test_tbar.set_postfix(test_acc=(correct/count).item())
+                test_tbar.set_postfix(test_acc="%.4f" % (correct/count).item())
             acc = correct / count
             writer.add_scalar("test_acc", acc, global_step=step)
         model.train()
@@ -359,6 +439,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Data hyperparameter
     parser.add_argument("--dataset", type=str, choices=["ag_news", "amazon_review_full", "yelp_polarity"], default="amazon_review_full")
+    parser.add_argument("--num_train", type=int, default=-1, help="Number of train dataset. Use first `num_train` row. -1 means whole dataset")
     # Model hyperparameter
     parser.add_argument("--restore", type=str)
     # Train hyperparameter
@@ -374,8 +455,8 @@ if __name__ == "__main__":
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
     if args.dataset == "ag_news":
-        train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"), tokenizer)
-        test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"), tokenizer)
+        train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"), tokenizer, args.num_train)
+        test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"), tokenizer, -1)
     elif args.dataset == "amazon_review_full":
         train_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "train.csv"), tokenizer)
         test_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "test.csv"), tokenizer)
@@ -384,31 +465,39 @@ if __name__ == "__main__":
         test_dataset = YelpPolarityDataset(os.path.join("dataset", "yelp_review_polarity_csv", "test.csv"), tokenizer)
 
     if args.augment == "none":
-        model = Bert(n_class=train_dataset.n_class)
+        model = create_bert_sentence_classification_model(n_class=train_dataset.n_class)
     elif args.augment == "tmix":
-        model = TMixBert(n_class=train_dataset.n_class, mixup_layer=args.mixup_layer)
+        model = create_tmix_bert_sentence_classification_model(n_class=train_dataset.n_class)
     elif args.augment == "adamix":
-        model = AdaMixBert(n_class=train_dataset.n_class, mixup_layer=args.mixup_layer)
+        model = create_adamix_bert_sentence_classification_model(n_class=train_dataset.n_class)
     elif args.augment == "pdistmix":
+        raise NotImplementedError("Not supported")
         model = PdistMixBert(n_class=train_dataset.n_class, mixup_layer=args.mixup_layer)
 
-    model.load()
+    model.load()     # Load BERT pretrained weight
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=CollateFn(tokenizer))
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
 
     if args.augment == "adamix":
         criterion = nn.CrossEntropyLoss(reduction='none')
+        criterion2 = nn.BCEWithLogitsLoss()
     else:
         criterion = nn.CrossEntropyLoss()
-    criterion2 = nn.BCEWithLogitsLoss()
-    optimizers = [optim.AdamW(itertools.chain(model.word_embeddings.parameters(),
-                                             model.position_embeddings.parameters(),
-                                             model.token_type_embeddings.parameters(),
-                                             model.embedding_norm.parameters(),
-                                             model.encoder.parameters()), lr=args.lr),
-                  optim.AdamW(model.classifier.parameters(), lr=args.lr)]
+
+    if args.augment == "none":
+        optimizers = [optim.AdamW(model.embedding_model.parameters(), lr=args.lr),
+                      optim.AdamW(model.classifier.parameters(), lr=1e-3)]
+    elif args.augment == "tmix":
+        optimizers = [optim.AdamW(model.mix_model.embedding_model.parameters(), lr=args.lr),
+                      optim.AdamW(model.classifier.parameters(), lr=1e-3)]
+    elif args.augment == "adamix":
+        optimizers = [optim.AdamW(model.mix_model.embedding_model.parameters(), lr=args.lr),
+                      optim.AdamW(model.mix_model.policy_region_generator.parameters(), lr=1e-3),
+                      optim.AdamW(model.mix_model.intrusion_classifier.parameters(), lr=1e-3),
+                      optim.AdamW(model.classifier.parameters(), lr=1e-3)]
+
     schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, max(-(x-20000)/(20000-1000), 0)))
-                for optimizer in optimizers]
+                  for optimizer in optimizers]
     scaler = torch.cuda.amp.GradScaler(enabled=True)
 
     print("CUDA: %d" % torch.cuda.is_available())
@@ -445,42 +534,29 @@ if __name__ == "__main__":
                     if args.augment == "none":
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                         loss = criterion(outputs, labels)
-                        #tbar.set_postfix(loss="%.4f" % loss.item())
-                    elif args.augment == "tmix" or args.augment == "pdistmix":
+                        tbar.set_postfix(loss="%.4f" % loss.item())
+                    elif args.augment in ["tmix", "adamix", "pdistmix"]:
                         mixup_indices = torch.randperm(input_ids.shape[0], device=device)
-                        lambda_ = np.random.beta(args.alpha, args.alpha)
-                        if lambda_ < 0.5:
-                            lambda_ = 1 - lambda_
-                        if args.augment == "tmix":
-                            outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, alpha=lambda_)
-                        else:
-                            outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, mixup_mask=mixup_mask, alpha=lambda_)
-                            if step % 50 == 0:
-                                #print(input_ids)
-                                fig, ax = plt.subplots(figsize=(8, 8))
-                                cross_sim = model.cross_sim[0].cpu().numpy()
-                                im = ax.imshow(cross_sim)
-                                for i in range(cross_sim.shape[0]):
-                                    ax.text(model.mixup_position[0, i], i, 'O', ha='center', va='center', color='w')
-                                writer.add_figure('cross_sim', fig, global_step=step)
-                                fig, ax = plt.subplots(figsize=(8, 8))
-                                mixup_mask = model.mixup_mask[0].cpu().numpy()
-                                im = ax.imshow(mixup_mask)
-                                writer.add_figure('mixup_mask', fig, global_step=step)
-
-                        loss1 = criterion(outputs, labels)
-                        loss2 = criterion(outputs, labels[mixup_indices])
-                        loss = lambda_ * loss1 + (1 - lambda_) * loss2
-                        tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss="%.4f" % loss.item())
-                    elif args.augment == "adamix":
-                        mixup_indices = torch.randperm(input_ids.shape[0], device=device)
-                        outs, mix_outs, intr, mix_intr, gamma = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices)
-                        loss1 = criterion(outs, labels).mean()
-                        loss2 = (gamma * criterion(mix_outs, labels) + (1 - gamma) * criterion(mix_outs, labels[mixup_indices])).mean()
-                        loss3 = criterion2(torch.cat((intr, mix_intr), dim=0),
-                                           torch.cat((torch.zeros_like(intr), torch.ones_like(mix_intr)), dim=0))
-                        loss = loss1 + loss2 + 7*loss3
-                        tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss3="%.4f" % loss3, loss="%.4f" % loss, gamma="%.4f" % gamma.mean())
+                        if args.augment in ["tmix", "pdistmix"]:
+                            lambda_ = np.random.beta(args.alpha, args.alpha)
+                            if lambda_ < 0.5:
+                                lambda_ = 1 - lambda_
+                            if args.augment == "tmix":
+                                outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
+                            else:
+                                outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, mixup_mask=mixup_mask, alpha=lambda_)
+                            loss1 = criterion(outputs, labels)
+                            loss2 = criterion(outputs, labels[mixup_indices])
+                            loss = lambda_ * loss1 + (1 - lambda_) * loss2
+                            tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss="%.4f" % loss.item())
+                        elif args.augment in ["adamix"]:
+                            outs, mix_outs, intr, mix_intr, gamma = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices)
+                            loss1 = criterion(outs, labels).mean()
+                            loss2 = (gamma * criterion(mix_outs, labels) + (1 - gamma) * criterion(mix_outs, labels[mixup_indices])).mean()
+                            loss3 = criterion2(torch.cat((intr, mix_intr), dim=0),
+                                               torch.cat((torch.zeros_like(intr), torch.ones_like(mix_intr)), dim=0))
+                            loss = loss1 + loss2 + loss3
+                            tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss3="%.4f" % loss3, loss="%.4f" % loss, gamma="%.4f" % gamma.mean())
                 writer.add_scalar("train_loss", loss, global_step=step)
                 for optimizer in optimizers:
                     optimizer.zero_grad()
@@ -496,7 +572,7 @@ if __name__ == "__main__":
                     scheduler.step()
                 step += 1
                 if step % 500 == 0:
-                    acc = evaluate(model, test_loader)
+                    acc = evaluate(model, test_loader, step)
                     if acc > best_acc:
                         torch.save({"epoch": epoch,
                                     "model": model.state_dict(),
