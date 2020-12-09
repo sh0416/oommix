@@ -437,6 +437,8 @@ def evaluate(model, loader, step):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    # Reproducibility parameter
+    parser.add_argument("--seed", type=int, default=0)
     # Data hyperparameter
     parser.add_argument("--dataset", type=str, choices=["ag_news", "amazon_review_full", "yelp_polarity"], default="amazon_review_full")
     parser.add_argument("--num_train", type=int, default=-1, help="Number of train dataset. Use first `num_train` row. -1 means whole dataset")
@@ -450,7 +452,12 @@ if __name__ == "__main__":
     parser.add_argument("--augment", type=str, choices=["none", "tmix", "adamix", "pdistmix"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=3)
     parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--eval_every", type=int, default=100)
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    
 
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
@@ -513,7 +520,6 @@ if __name__ == "__main__":
         for scheduler, restored_state_dict in zip(schedulers, checkpoints["schedulers"]):
             scheduler.load_state_dict(restored_state_dict)
 
-    writer.add_hparams(hparam_dict=vars(args), metric_dict={})
     step, best_acc = 0, 0
     model.to(device)
     for epoch in range(args.epoch):
@@ -571,12 +577,15 @@ if __name__ == "__main__":
                 for scheduler in schedulers:
                     scheduler.step()
                 step += 1
-                if step % 500 == 0:
+                if step % args.eval_every == 0:
                     acc = evaluate(model, test_loader, step)
                     if acc > best_acc:
+                        best_acc = acc
                         torch.save({"epoch": epoch,
                                     "model": model.state_dict(),
                                     "optimizer": [optimizer.state_dict() for optimizer in optimizers],
                                     "scheduler": [scheduler.state_dict() for scheduler in schedulers]},
                                    "checkpoint_best.pt")
 
+    writer.add_hparams(hparam_dict=vars(args), metric_dict={"test_acc": best_acc})
+    writer.close()
