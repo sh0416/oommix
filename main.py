@@ -2,6 +2,7 @@ import os
 import csv
 import math
 import pprint
+import random
 import argparse
 import itertools
 from collections import Counter
@@ -20,6 +21,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 torch.set_printoptions(profile="full", linewidth=150)
+
+from torchviz import make_dot
 
 #config = RobertaConfig.from_pretrained("roberta-base")
 config = BertConfig.from_pretrained("bert-base-uncased")
@@ -76,10 +79,21 @@ def save_csv(filepath, data, fieldnames):
             writer.writerow(row)
 
 
-def preprocess(f, filepath, tokenizer):
-    cached_filepath = os.path.join('cache', filepath)
+def get_cached_filepath(filepath, is_valid=None):
+    if is_valid == None:
+        return os.path.join('cache', filepath)
+    elif is_valid == True:
+        return os.path.join('cache', filepath + '_valid')
+    elif is_valid == False:
+        return os.path.join('cache', filepath + '_train')
+    else:
+        raise AttributeError('Invalid argument')
+
+
+def preprocess(load_f, filepath, tokenizer, is_valid=None):
+    cached_filepath = get_cached_filepath(filepath, is_valid)
     if not os.path.exists(cached_filepath):
-        data = f(filepath)
+        data = load_f(filepath, is_valid)
         for row in tqdm(data, desc="Tokenize amazon text"):
             row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=512, truncation=True)["input_ids"]))
         os.makedirs(os.path.dirname(cached_filepath), exist_ok=True)
@@ -90,15 +104,19 @@ def preprocess(f, filepath, tokenizer):
     return data
 
 
-def load_ag_news(filepath):
+def load_ag_news(filepath, is_valid=None):
     data = [{"label": int(row["class"]) - 1, "input": row["title"]}
             for row in tqdm(load_csv(filepath, ["class", "title", "description"]), desc="Load ag news dataset")]
+    if is_valid is not None:
+        random.Random(42).shuffle(data)
+        valid_size = int(0.1*len(data))
+        data = data[:valid_size] if is_valid else data[valid_size:]
     return data
 
 
 class AGNewsDataset(ListDataset):
-    def __init__(self, filepath, tokenizer, data_size):
-        self.data = preprocess(load_ag_news, filepath, tokenizer)
+    def __init__(self, filepath, tokenizer, data_size, is_valid=None):
+        self.data = preprocess(load_ag_news, filepath, tokenizer, is_valid)
         self.n_class = 4
         if data_size != -1:
             self.data = self.data[:min(data_size, len(self.data))]
@@ -248,12 +266,13 @@ class AdaMix(nn.Module):
         super().__init__()
         self.embedding_model = embedding_model
         self.policy_region_generator = nn.Sequential(
-            nn.Linear(2*self.embedding_model.embed_dim, 3),
+            nn.Linear(2*self.embedding_model.embed_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 3),
             nn.Softmax(dim=1))
-        self.intrusion_classifier = nn.Linear(self.embedding_model.embed_dim, 1)
         self.mixup_layer = mixup_layer
 
-    def forward(self, input_ids, attention_mask, mixup_indices=None):
+    def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
         batch, seq_len = input_ids.shape
         h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
 
@@ -264,7 +283,6 @@ class AdaMix(nn.Module):
             # Policy Region Generator
             sentence_h = h.mean(dim=1)
             policy_region = self.policy_region_generator(torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1))  # [B, 3]
-            eps = torch.rand(policy_region.shape[0], device=policy_region.device)
             gamma = policy_region[:, 1] * eps + policy_region[:, 0]
             mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
 
@@ -273,14 +291,10 @@ class AdaMix(nn.Module):
             if mixup_indices is not None:
                 mix_h = self.embedding_model.forward_layer(mix_h, attention_mask, module_dict, batch, seq_len)
 
-        # Classifier
         if mixup_indices is None:
             return h
         else:
-            # Intrusion Discriminator
-            intr = self.intrusion_classifier(h)
-            mix_intr = self.intrusion_classifier(mix_h)
-            return h, mix_h, intr, mix_intr, gamma
+            return h, mix_h, gamma
 
     def predict(self, input_ids, attention_mask):
         return super().forward(input_ids=input_ids, attention_mask=attention_mask)
@@ -331,17 +345,29 @@ class AdaMixSentenceClassificationModel(nn.Module):
             nn.Tanh(),
             nn.Linear(128, n_class)
         )
+        self.intrusion_classifier = nn.Sequential(
+            nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1)
+        )
 
-    def forward(self, input_ids, attention_mask, mixup_indices=None):
+    def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
         if mixup_indices is None:
             h = self.mix_model(input_ids, attention_mask)
             return self.classifier(torch.mean(h, dim=1))
         else:
-            h, mix_h, intr, mix_intr, gamma = self.mix_model(input_ids, attention_mask, mixup_indices)
+            h, mix_h, gamma = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
             out = self.classifier(torch.mean(h, dim=1))
             mix_out = self.classifier(torch.mean(mix_h, dim=1))
-            return out, mix_out, intr, mix_intr, gamma
+            return out, mix_out, gamma
         
+    def predict_intrusion(self, input_ids, attention_mask, mixup_indices, eps):
+        h, mix_h, gamma = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
+        # Intrusion Discriminator
+        intr = self.intrusion_classifier(h)
+        mix_intr = self.intrusion_classifier(mix_h)
+        return intr, mix_intr
+
     def load(self):
         self.mix_model.embedding_model.load()
 
@@ -418,7 +444,7 @@ class PdistMixBert(TMix):
 def evaluate(model, loader, step):
     with torch.no_grad():
         model.eval()
-        with tqdm(loader, desc="Evaluate", ncols=200, leave=True, position=0) as test_tbar:
+        with tqdm(loader, desc="Evaluate", ncols=200, leave=True) as test_tbar:
             correct, count = 0, 0
             for batch in test_tbar:
                 input_ids = batch["inputs"]["input_ids"].to(device) 
@@ -430,7 +456,7 @@ def evaluate(model, loader, step):
                 count += labels.shape[0]
                 test_tbar.set_postfix(test_acc="%.4f" % (correct/count).item())
             acc = correct / count
-            writer.add_scalar("test_acc", acc, global_step=step)
+            writer.add_scalar("acc", acc, global_step=step)
         model.train()
     return acc
 
@@ -458,11 +484,11 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
     if args.dataset == "ag_news":
-        train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"), tokenizer, args.num_train)
+        train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"), tokenizer, args.num_train, False)
+        valid_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"), tokenizer, -1, True)
         test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"), tokenizer, -1)
     elif args.dataset == "amazon_review_full":
         train_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "train.csv"), tokenizer)
@@ -483,6 +509,7 @@ if __name__ == "__main__":
 
     model.load()     # Load BERT pretrained weight
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=CollateFn(tokenizer))
+    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=CollateFn(tokenizer))
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
 
     if args.augment == "adamix":
@@ -492,18 +519,20 @@ if __name__ == "__main__":
         criterion = nn.CrossEntropyLoss()
 
     if args.augment == "none":
-        optimizers = [optim.AdamW(model.embedding_model.parameters(), lr=args.lr),
-                      optim.AdamW(model.classifier.parameters(), lr=1e-3)]
+        optimizers = [optim.Adam(model.embedding_model.parameters(), lr=args.lr),
+                      optim.Adam(model.classifier.parameters(), lr=1e-3)]
     elif args.augment == "tmix":
-        optimizers = [optim.AdamW(model.mix_model.embedding_model.parameters(), lr=args.lr),
-                      optim.AdamW(model.classifier.parameters(), lr=1e-3)]
+        optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
+                      optim.Adam(model.classifier.parameters(), lr=1e-3)]
     elif args.augment == "adamix":
-        optimizers = [optim.AdamW(model.mix_model.embedding_model.parameters(), lr=args.lr),
-                      optim.AdamW(model.mix_model.policy_region_generator.parameters(), lr=1e-3),
-                      optim.AdamW(model.mix_model.intrusion_classifier.parameters(), lr=1e-3),
-                      optim.AdamW(model.classifier.parameters(), lr=1e-3)]
+        optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
+                      optim.Adam(model.mix_model.policy_region_generator.parameters(), lr=1e-3),
+                      optim.Adam(model.intrusion_classifier.parameters(), lr=1e-3),
+                      optim.Adam(model.classifier.parameters(), lr=1e-3)]
 
-    schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, max(-(x-20000)/(20000-1000), 0)))
+    #schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, max(-(x-20000)/(20000-1000), 0)))
+    #              for optimizer in optimizers]
+    schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
                   for optimizer in optimizers]
     scaler = torch.cuda.amp.GradScaler(enabled=True)
 
@@ -522,6 +551,8 @@ if __name__ == "__main__":
 
     step, best_acc = 0, 0
     model.to(device)
+    for optimizer in optimizers:
+        optimizer.zero_grad()
     for epoch in range(args.epoch):
         with tqdm(train_loader, desc="Epoch %d" % epoch, ncols=200) as tbar:
             for batch in tbar:
@@ -541,6 +572,7 @@ if __name__ == "__main__":
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                         loss = criterion(outputs, labels)
                         tbar.set_postfix(loss="%.4f" % loss.item())
+                        scaler.scale(loss).backward()
                     elif args.augment in ["tmix", "adamix", "pdistmix"]:
                         mixup_indices = torch.randperm(input_ids.shape[0], device=device)
                         if args.augment in ["tmix", "pdistmix"]:
@@ -555,18 +587,40 @@ if __name__ == "__main__":
                             loss2 = criterion(outputs, labels[mixup_indices])
                             loss = lambda_ * loss1 + (1 - lambda_) * loss2
                             tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss="%.4f" % loss.item())
+                            scaler.scale(loss).backward()
                         elif args.augment in ["adamix"]:
-                            outs, mix_outs, intr, mix_intr, gamma = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices)
+                            eps = torch.rand(input_ids.shape[0], device=input_ids.device)
+                            # Calculate gradient for normal classifier
+                            outs, mix_outs, gamma = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, eps=eps)
                             loss1 = criterion(outs, labels).mean()
                             loss2 = (gamma * criterion(mix_outs, labels) + (1 - gamma) * criterion(mix_outs, labels[mixup_indices])).mean()
-                            loss3 = criterion2(torch.cat((intr, mix_intr), dim=0),
-                                               torch.cat((torch.zeros_like(intr), torch.ones_like(mix_intr)), dim=0))
-                            loss = loss1 + loss2 + loss3
-                            tbar.set_postfix(loss1="%.4f" % loss1, loss2="%.4f" % loss2, loss3="%.4f" % loss3, loss="%.4f" % loss, gamma="%.4f" % gamma.mean())
+                            loss = loss1 + loss2
+                            #dot = make_dot(loss, params=dict(model.named_parameters()))
+                            #dot.format = 'png'
+                            #dot.render("gradient_tree1")
+                            scaler.scale(loss).backward()
+                            # Calculate gradient for intrusion classifier
+                            for param in model.mix_model.embedding_model.parameters():
+                                param.requires_grad = False
+                            #for param in model.mix_model.policy_region_generator.parameters():
+                            #    print(param.requires_grad)
+                            outs, mix_outs = model.predict_intrusion(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, eps=eps)
+                            intr_loss = criterion2(torch.cat((outs, mix_outs), dim=0),
+                                                   torch.cat((torch.zeros_like(outs), torch.ones_like(mix_outs)), dim=0))
+                            #dot = make_dot(intr_loss, params=dict(model.named_parameters()))
+                            #dot.format = 'png'
+                            #dot.render("gradient_tree2")
+                            #for k, param in model.mix_model.policy_region_generator.named_parameters():
+                            #    if k == "2.bias":
+                            #        print('before', k, param.grad)
+                            scaler.scale(intr_loss).backward()
+                            #for k, param in model.mix_model.policy_region_generator.named_parameters():
+                            #    if k == "2.bias":
+                            #        print('after', k, param.grad)
+                            for param in model.mix_model.embedding_model.parameters():
+                                param.requires_grad = True
+                            tbar.set_postfix(loss="%.4f" % loss, intr_loss="%.4f" % intr_loss, gamma="%.4f" % gamma.mean())
                 writer.add_scalar("train_loss", loss, global_step=step)
-                for optimizer in optimizers:
-                    optimizer.zero_grad()
-                scaler.scale(loss).backward()
                 # Track gradient norm
                 #with torch.no_grad():
                 #    for k, v in model.named_parameters():
@@ -576,16 +630,26 @@ if __name__ == "__main__":
                     scaler.update()
                 for scheduler in schedulers:
                     scheduler.step()
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
                 step += 1
                 if step % args.eval_every == 0:
-                    acc = evaluate(model, test_loader, step)
-                    if acc > best_acc:
-                        best_acc = acc
+                    train_acc = evaluate(model, train_loader, step)
+                    valid_acc = evaluate(model, valid_loader, step)
+                    print("train_accuracy: %.4f, valid_accuracy: %.4f" % (train_acc, valid_acc))
+                    if valid_acc > best_acc:
+                        best_acc = valid_acc
+                        test_acc = evaluate(model, test_loader, step)
+                        print("Best valid accuracy! test accuracy: %.4f" % (test_acc))
                         torch.save({"epoch": epoch,
                                     "model": model.state_dict(),
                                     "optimizer": [optimizer.state_dict() for optimizer in optimizers],
                                     "scheduler": [scheduler.state_dict() for scheduler in schedulers]},
                                    "checkpoint_best.pt")
+                        writer.add_scalars('acc', {"train": train_acc, "valid": valid_acc, "test": test_acc}, step)
+                    else:
+                        writer.add_scalars('acc', {"train": train_acc, "valid": valid_acc}, step)
 
-    writer.add_hparams(hparam_dict=vars(args), metric_dict={"test_acc": best_acc})
+    writer.add_hparams(hparam_dict=vars(args), metric_dict={"test_acc": test_acc})
     writer.close()
+
