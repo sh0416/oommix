@@ -2,6 +2,7 @@ import os
 import csv
 import math
 import pprint
+import random
 import argparse
 import itertools
 from collections import Counter
@@ -77,7 +78,7 @@ def save_csv(filepath, data, fieldnames):
 
 
 def preprocess(f, filepath, tokenizer):
-    cached_filepath = os.path.join('cache', filepath)
+    cached_filepath = os.path.join('cache', 'cache_'+filepath)
     if not os.path.exists(cached_filepath):
         data = f(filepath)
         for row in tqdm(data, desc="Tokenize amazon text"):
@@ -101,6 +102,7 @@ class AGNewsDataset(ListDataset):
         self.data = preprocess(load_ag_news, filepath, tokenizer)
         self.n_class = 4
         if data_size != -1:
+            random.Random(42).shuffle(self.data)
             self.data = self.data[:min(data_size, len(self.data))]
 
 
@@ -440,8 +442,9 @@ if __name__ == "__main__":
     # Reproducibility parameter
     parser.add_argument("--seed", type=int, default=0)
     # Data hyperparameter
-    parser.add_argument("--dataset", type=str, choices=["ag_news", "amazon_review_full", "yelp_polarity"], default="amazon_review_full")
-    parser.add_argument("--num_train", type=int, default=-1, help="Number of train dataset. Use first `num_train` row. -1 means whole dataset")
+    parser.add_argument("--data_dir", type=str, required=True)
+    parser.add_argument("--dataset", type=str, choices=["ag_news"], default="ag_news")
+    parser.add_argument("--num_train_data", type=int, default=-1, help="Number of train dataset. Use first `num_train` row. -1 means whole dataset")
     # Model hyperparameter
     parser.add_argument("--restore", type=str)
     # Train hyperparameter
@@ -452,24 +455,26 @@ if __name__ == "__main__":
     parser.add_argument("--augment", type=str, choices=["none", "tmix", "adamix", "pdistmix"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=3)
     parser.add_argument("--alpha", type=float, default=0.2)
-    parser.add_argument("--eval_every", type=int, default=100)
+    parser.add_argument("--eval_every", type=int, default=500)
+    parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
 
+    print("CUDA: %d" % torch.cuda.is_available())
+    device = torch.device("cuda:%d" % args.gpu if torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    
 
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
     if args.dataset == "ag_news":
-        train_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "train.csv"), tokenizer, args.num_train)
-        test_dataset = AGNewsDataset(os.path.join("dataset", "ag_news_csv", "test.csv"), tokenizer, -1)
+        train_dataset = AGNewsDataset(os.path.join(args.data_dir, "train.csv"), tokenizer, args.num_train_data)
+        test_dataset = AGNewsDataset(os.path.join(args.data_dir, "test.csv"), tokenizer, -1)
     elif args.dataset == "amazon_review_full":
-        train_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "train.csv"), tokenizer)
-        test_dataset = AmazonReviewFullDataset(os.path.join("dataset", "amazon_review_full_csv", "test.csv"), tokenizer)
+        train_dataset = AmazonReviewFullDataset(os.path.join(args.data_dir, "train.csv"), tokenizer)
+        test_dataset = AmazonReviewFullDataset(os.path.join(args.data_dir, "test.csv"), tokenizer)
     elif args.dataset == "yelp_polarity":
-        train_dataset = YelpPolarityDataset(os.path.join("dataset", "yelp_review_polarity_csv", "train.csv"), tokenizer)
-        test_dataset = YelpPolarityDataset(os.path.join("dataset", "yelp_review_polarity_csv", "test.csv"), tokenizer)
+        train_dataset = YelpPolarityDataset(os.path.join(args.data_dir, "train.csv"), tokenizer)
+        test_dataset = YelpPolarityDataset(os.path.join(args.data_dir, "test.csv"), tokenizer)
 
     if args.augment == "none":
         model = create_bert_sentence_classification_model(n_class=train_dataset.n_class)
@@ -482,7 +487,7 @@ if __name__ == "__main__":
         model = PdistMixBert(n_class=train_dataset.n_class, mixup_layer=args.mixup_layer)
 
     model.load()     # Load BERT pretrained weight
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=CollateFn(tokenizer))
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, collate_fn=CollateFn(tokenizer))
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=CollateFn(tokenizer))
 
     if args.augment == "adamix":
@@ -506,9 +511,6 @@ if __name__ == "__main__":
     schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, max(-(x-20000)/(20000-1000), 0)))
                   for optimizer in optimizers]
     scaler = torch.cuda.amp.GradScaler(enabled=True)
-
-    print("CUDA: %d" % torch.cuda.is_available())
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     writer = SummaryWriter()
 
