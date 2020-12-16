@@ -110,7 +110,8 @@ class TMix(nn.Module):
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
         batch, seq_len = input_ids.shape
-        h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
+        with torch.no_grad():
+            h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
         for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
             h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
         if mixup_indices is not None:

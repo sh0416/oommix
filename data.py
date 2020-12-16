@@ -3,12 +3,14 @@ import csv
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
 class ListDataset(Dataset):
-    def __init__(self, data, n_class):
+    def __init__(self, data, n_class, data_size):
         self.data = data
         self.n_class = n_class
+        self.data_size = data_size if data_size != -1 else len(self.data)
 
     def __getitem__(self, idx):
         data = self.data[idx]
@@ -16,7 +18,7 @@ class ListDataset(Dataset):
                 "label": torch.tensor(data["label"], dtype=torch.long)}
     
     def __len__(self):
-        return len(self.data)
+        return self.data_size
 
 
 def load_csv(filepath, fieldnames=None):
@@ -33,15 +35,8 @@ def save_csv(filepath, data, fieldnames):
         writer.writerows(data)
 
 
-def get_cached_filepath(filepath, is_valid=None):
-    if is_valid == None:
-        return os.path.join('cache', filepath)
-    elif is_valid == True:
-        return os.path.join('cache', filepath + '_valid')
-    elif is_valid == False:
-        return os.path.join('cache', filepath + '_train')
-    else:
-        raise AttributeError('Invalid argument')
+def get_cached_filepath(filepath):
+    return os.path.join('cache', filepath)
 
 
 def preprocess(load_f, filepath, tokenizer):
@@ -61,6 +56,11 @@ def load_ag_news(filepath):
             for row in tqdm(load_csv(filepath, ["class", "title", "description"]), desc="Load ag news dataset")]
 
 
+def load_yahoo_answer(filepath):
+    return [{"label": int(row["class"]) - 1, "input": row["title"]}
+            for row in tqdm(load_csv(filepath, ["class", "title", "content", "answer"]), desc="Load yahoo dataset")]
+
+
 def load_amazon_review_full(filepath):
     return [{"label": int(row["class"]) - 1, "input": row["text"]}
             for row in tqdm(load_csv(filepath, ["class", "title", "text"]), desc="Load amazon dataset")]
@@ -72,10 +72,13 @@ def load_yelp_polarity(filepath):
     return data
 
 
-def create_dataset(dataset, filepath, tokenizer):
+def create_dataset(dataset, filepath, tokenizer, num_train_data=-1):
     if dataset == "ag_news":
         data_load_func = load_ag_news
         n_class = 4
+    elif dataset == "yahoo_answer":
+        data_load_func = load_yahoo_answer
+        n_class = 10
     elif dataset == "amazon_review_full":
         data_load_func = load_amazon_review_full
         n_class = 5
@@ -85,7 +88,7 @@ def create_dataset(dataset, filepath, tokenizer):
     else:
         raise AttributeError("Invalid dataset")
     data = preprocess(data_load_func, filepath, tokenizer)
-    return ListDataset(data, n_class)
+    return ListDataset(data, n_class, num_train_data)
     
     
 
