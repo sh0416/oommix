@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-import wandb
+#import wandb
 from torch.utils.tensorboard import SummaryWriter
 from transformers import BertModel, BertConfig, BertTokenizerFast
 import matplotlib
@@ -56,7 +56,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=96)
     parser.add_argument("--lr", type=float, default=2e-5)
     # Train hyperparameter - augmentation
-    parser.add_argument("--augment", type=str, choices=["none", "tmix", "adamix", "pdistmix"], default="none")
+    parser.add_argument("--augment", type=str, choices=["none", "tmix", "adamix", "proposed"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=3)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--eval_every", type=int, default=500)
@@ -106,6 +106,9 @@ if __name__ == "__main__":
     if args.augment == "none":
         optimizers = [optim.Adam(model.embedding_model.parameters(), lr=args.lr),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
+    elif args.augment == "proposed":
+        optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
+                      optim.Adam(model.classifier.parameters(), lr=1e-3)]
     elif args.augment == "tmix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
@@ -121,7 +124,7 @@ if __name__ == "__main__":
                   for optimizer in optimizers]
     scaler = torch.cuda.amp.GradScaler(enabled=False)
 
-    writer = SummaryWriter()
+    #writer = SummaryWriter()
 
     if args.restore is not None:
         checkpoint = torch.load(args.restore)
@@ -149,6 +152,32 @@ if __name__ == "__main__":
 
                 if args.augment == "none":
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    loss = criterion(outputs, labels)
+                    scaler.scale(loss).backward()
+                    logging.info("Loss: %.4f" % loss.item())
+                elif args.augment == "proposed":
+                    mixup_indices = torch.randperm(input_ids.shape[0], device=device)
+                    with torch.no_grad():
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, lambda_=1)
+                        w = model.classifier.weight.data  # [C, K]
+                        f = model.h  # [B, L, K]
+                        class_score = torch.matmul(f, w.transpose(0, 1)) # [B, L, C]
+                        class_score = torch.gather(class_score, dim=2, index=labels[:, None, None].expand(-1, class_score.shape[1], -1)).squeeze(2) # [B, L]
+                        """
+                        example = list(zip(tokenizer.convert_ids_to_tokens(input_ids[0].detach().cpu().tolist()),
+                                            class_score[0, :, labels[0]].cpu().tolist()))
+                        example = [(idx, word, score) for idx, (word, score) in enumerate(example)]
+                        example = sorted(example, key=lambda x: x[2], reverse=True)
+                        logging.info("Sentence:")
+                        for idx, word, score in example:
+                            logging.info("Position: %d, Word: %s, Score: %.4f" % (idx, word, score))
+                        """
+                        from model import masked_softmax
+                        class_score = masked_softmax(class_score, mask=attention_mask, dim=1)
+                        idx = torch.argsort(class_score, dim=1, descending=True)
+                    lambda_ = np.random.beta(args.alpha, args.alpha)
+                    outputs = model(input_ids=input_ids, idx=idx,
+                                    attention_mask=attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
                     loss = criterion(outputs, labels)
                     scaler.scale(loss).backward()
                     logging.info("Loss: %.4f" % loss.item())
@@ -190,9 +219,8 @@ if __name__ == "__main__":
             step += 1
             if step % args.eval_every == 0:
                 logging.info("Evaluate model")
-                train_acc = evaluate(model, train_loader, step)
                 valid_acc = evaluate(model, valid_loader, step)
-                logging.info("Train accuracy: %.4f, Valid accuracy: %.4f" % (train_acc, valid_acc))
+                logging.info("Valid accuracy: %.4f" % (valid_acc))
                 if valid_acc > best_acc:
                     best_acc = valid_acc
                     test_acc = evaluate(model, test_loader, step)
@@ -213,5 +241,5 @@ if __name__ == "__main__":
         if patience == 2:
             break
 
-    writer.add_hparams(hparam_dict=vars(args), metric_dict={"test_acc": test_acc})
-    writer.close()
+    #writer.add_hparams(hparam_dict=vars(args), metric_dict={"test_acc": test_acc})
+    #writer.close()

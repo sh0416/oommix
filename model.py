@@ -20,6 +20,14 @@ def masked_argmax(vec, mask, dim, keepdim=False):
     return torch.argmax(masked_vec_rank, dim=dim, keepdim=keepdim)
 
 
+def masked_sum(vec, mask, dim, keepdim=False):
+    return torch.sum(vec * mask.float(), dim=dim, keepdim=keepdim)
+
+
+def masked_mean(vec, mask, dim, keepdim=False):
+    return masked_sum(vec, mask, dim, keepdim) / torch.sum(mask.float(), dim=dim, keepdim=keepdim)
+
+
 class Bert(nn.Module):
     def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
                  n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, n_class=4):
@@ -121,6 +129,28 @@ class TMix(nn.Module):
         return h
 
 
+class ProposedMix(nn.Module):
+    def __init__(self, embedding_model, mixup_layer=0):
+        super().__init__()
+        self.embedding_model = embedding_model
+        self.mixup_layer = mixup_layer
+
+    def forward(self, input_ids, attention_mask, idx=None, mixup_indices=None, lambda_=None):
+        batch, seq_len = input_ids.shape
+        with torch.no_grad():
+            h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
+            if idx is not None:
+                h = torch.gather(h, dim=1, index=idx[:, :, None].expand(-1, -1, h.shape[2]))
+                attention_mask = torch.gather(attention_mask, dim=1, index=idx)
+        for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+        if mixup_indices is not None:
+            h = lambda_ * h + (1 - lambda_) * h[mixup_indices]
+        for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+        return h
+
+
 def print_gradient(grad):
     wandb.log({"Gamma gradient": grad.detach()})
     #print(grad)
@@ -182,15 +212,12 @@ class SentenceClassificationModel(nn.Module):
     def __init__(self, embedding_model, n_class):
         super().__init__()
         self.embedding_model = embedding_model
-        self.classifier = nn.Sequential(
-            nn.Linear(self.embedding_model.embed_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, n_class)
-        )
+        self.classifier = nn.Linear(embedding_model.embed_dim, n_class, bias=False)
 
     def forward(self, input_ids, attention_mask):
         h = self.embedding_model(input_ids, attention_mask)
-        return self.classifier(torch.mean(h, dim=1))
+        self.h = h
+        return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
 
     def load(self):
         self.embedding_model.load()
@@ -200,15 +227,29 @@ class TMixSentenceClassificationModel(nn.Module):
     def __init__(self, mix_model, n_class):
         super().__init__()
         self.mix_model = mix_model
-        self.classifier = nn.Sequential(
-            nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, n_class)
-        )
+        self.classifier = nn.Linear(self.mix_model.embedding_model.embed_dim, n_class)
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
         h = self.mix_model(input_ids, attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
-        return self.classifier(torch.mean(h, dim=1))
+        self.h = h
+        return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
+
+    def load(self):
+        self.mix_model.embedding_model.load()
+
+
+class ProposedMixSentenceClassificationModel(nn.Module):
+    def __init__(self, mix_model, n_class):
+        super().__init__()
+        self.mix_model = mix_model
+        self.classifier = nn.Linear(self.mix_model.embedding_model.embed_dim, n_class)
+
+    def forward(self, input_ids, attention_mask, idx=None, mixup_indices=None, lambda_=None):
+        h = self.mix_model(input_ids, attention_mask, idx=idx, mixup_indices=mixup_indices, lambda_=1)
+        self.h = h
+        if idx is not None:
+            attention_mask = torch.gather(attention_mask, dim=1, index=idx)
+        return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
 
     def load(self):
         self.mix_model.embedding_model.load()
@@ -236,7 +277,7 @@ class AdaMixSentenceClassificationModel(nn.Module):
         else:
             h, mix_h, gamma = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
             out = self.classifier(torch.mean(h, dim=1))
-            mix_out = self.classifier(torch.mean(mix_h, dim=1))
+            mix_out = self.classifier(masked_mean(mix_h, attention_mask, dim=1))
             return out, mix_out, gamma
         
     def predict_intrusion(self, input_ids, attention_mask, mixup_indices, eps):
@@ -258,6 +299,9 @@ def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, 
                            feedforward_dim=feedforward_dim, n_layer=n_layer)
     if augment == "none":
         model = SentenceClassificationModel(embedding_model, n_class)
+    elif augment == "proposed":
+        embedding_model = ProposedMix(embedding_model, mixup_layer=mixup_layer)
+        model = ProposedMixSentenceClassificationModel(embedding_model, n_class)
     elif augment == "tmix":
         embedding_model = TMix(embedding_model, mixup_layer=mixup_layer)
         model = TMixSentenceClassificationModel(embedding_model, n_class)
@@ -267,46 +311,3 @@ def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, 
     else:
         raise AttributeError("Invalid augment")
     return model
-
-
-class PdistMixBert(TMix):
-    def forward(self, input_ids, attention_mask, mixup_indices=None, mixup_mask=None, alpha=None):
-        """
-        :param mixup_indices: batch level shuffle index list
-        :type mixup_indices: torch.LongTensor(B)
-        :param mixup_mask: token level mask array. True for normal token False for special token such as pad, cls, sep
-        :type mixup_mask: torch.LongTensor(B, L)
-        """
-        batch, seq_len = input_ids.shape
-        h = self._forward_embedding(input_ids, batch, seq_len)
-        for i, module_dict in enumerate(self.encoder):
-            if i == self.mixup_layer and mixup_indices is not None:
-                with torch.no_grad():
-                    cls_mask = mixup_mask["is_cls"]
-                    cls_mask = torch.logical_and(cls_mask[:, :, None], cls_mask[mixup_indices][:, None, :])
-                    sep_mask = mixup_mask["is_sep"]
-                    sep_mask = torch.logical_and(sep_mask[:, :, None], sep_mask[mixup_indices][:, None, :])
-                    normal_mask = mixup_mask["is_normal"]
-                    normal_mask = torch.logical_and(normal_mask[:, :, None], normal_mask[mixup_indices][:, None, :])
-                    mixup_mask = cls_mask | sep_mask | normal_mask # [B, L1, L2]
-                    with torch.no_grad():
-                        model.mixup_mask = mixup_mask.detach()
-                    q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
-                    k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
-                    q = q.permute(0, 2, 1, 3)
-                    k = k.permute(0, 2, 3, 1)
-                    # Challenge. Query vs Key? Query vs Query? Key vs Key?
-                    cross_a = torch.matmul(q, k[mixup_indices]) / math.sqrt(self.k_dim) # [B, H, L1, L2]
-                    cross_a = masked_softmax(cross_a, attention_mask[mixup_indices][:, None, None, :], dim=3)
-                    # Challenge. Multi-head similarity? mean? max? approx?
-                    cross_sim = torch.max(cross_a, dim=1)[0] # [B, L1, L2]
-                    # Inspect similarity
-                    with torch.no_grad():
-                        self.cross_sim = cross_sim.detach()
-                    mixup_position = masked_argmax(cross_sim, mixup_mask, dim=2, keepdim=True) # [B, L1, 1]
-                    with torch.no_grad():
-                        self.mixup_position = mixup_position.detach()
-                h2 = torch.gather(input=h[mixup_indices], dim=1, index=mixup_position.expand(-1, -1, h.shape[2]))
-                h = alpha * h + (1 - alpha) * h2
-            h = self._forward_layer(h, attention_mask, module_dict, batch, seq_len)
-        return self.classifier(torch.mean(h, dim=1))
