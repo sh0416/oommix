@@ -52,9 +52,10 @@ if __name__ == "__main__":
     # Model hyperparameter
     parser.add_argument("--restore", type=str)
     # Train hyperparameter
-    parser.add_argument("--epoch", type=int, default=100)
+    parser.add_argument("--epoch", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=96)
     parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--drop_prob", type=float, default=0.1)
     # Train hyperparameter - augmentation
     parser.add_argument("--augment", type=str, choices=["none", "tmix", "adamix", "proposed"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=3)
@@ -63,9 +64,11 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
 
-    os.makedirs('log', exist_ok=True)
+    os.makedirs("log", exist_ok=True)
+    os.makedirs("ckpt", exist_ok=True)
+    experiment_id = datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')
     logging.basicConfig(handlers=[logging.StreamHandler(),
-                                  logging.FileHandler(os.path.join('log', datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')))],
+                                  logging.FileHandler(os.path.join('log', experiment_id))],
                         level=logging.INFO)
 
     logging.info("CUDA: %d" % torch.cuda.is_available())
@@ -75,25 +78,20 @@ if __name__ == "__main__":
 
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
-    train_dataset = create_dataset(dataset=args.dataset,
-                                   filepath=os.path.join(args.data_dir, "train.csv"),
-                                   tokenizer=tokenizer,
-                                   num_train_data=args.num_train_data)
-    test_dataset = create_dataset(dataset=args.dataset,
-                                  filepath=os.path.join(args.data_dir, "test.csv"),
-                                  tokenizer=tokenizer)
-    train_num, valid_num = int(0.9*len(train_dataset)), len(train_dataset)-int(0.9*len(train_dataset))
-    train_dataset, valid_dataset = random_split(train_dataset,
-                                                lengths=[train_num, valid_num],
-                                                generator=torch.Generator().manual_seed(42))
+    train_dataset, valid_dataset, test_dataset = create_dataset(
+        dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer, num_train_data=args.num_train_data)
+    logging.info("Train data: %d" % (len(train_dataset)))
+    logging.info("Valid data: %d" % (len(valid_dataset)))
+    logging.info("Test data: %d" % (len(test_dataset)))
     collate_fn = CollateFn(tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate_fn)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=collate_fn)
 
-    model = create_model(augment=args.augment, mixup_layer=args.mixup_layer, n_class=test_dataset.n_class, n_layer=6)
+    model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
+                         n_class=test_dataset.n_class, n_layer=6, drop_prob=args.drop_prob)
     model.load()     # Load BERT pretrained weight
     #wandb.watch(model)
 
@@ -223,22 +221,19 @@ if __name__ == "__main__":
                 logging.info("Valid accuracy: %.4f" % (valid_acc))
                 if valid_acc > best_acc:
                     best_acc = valid_acc
-                    test_acc = evaluate(model, test_loader, step)
-                    logging.info("Best valid accuracy! test accuracy: %.4f" % (test_acc))
+                    #test_acc = evaluate(model, test_loader, step)
+                    #logging.info("Best valid accuracy! test accuracy: %.4f" % (test_acc))
                     torch.save({"epoch": epoch,
                                 "model": model.state_dict(),
                                 "optimizer": [optimizer.state_dict() for optimizer in optimizers],
                                 "scheduler": [scheduler.state_dict() for scheduler in schedulers]},
-                                "checkpoint_best.pt")
-                    #writer.add_scalars('acc', {"train": train_acc, "valid": valid_acc, "test": test_acc}, step)
-                    #wandb.log({"Train acc": train_acc, "Valid acc": valid_acc, "Test acc": test_acc})
+                                os.path.join("ckpt", "%s_best.pt" % experiment_id))
+                    patience = 0
                 else:
                     patience += 1
-                    if patience == 2:
+                    if patience == 10:
                         break
-                    #writer.add_scalars('acc', {"train": train_acc, "valid": valid_acc}, step)
-                    #wandb.log({"Train acc": train_acc, "Valid acc": valid_acc})
-        if patience == 2:
+        if patience == 10:
             break
 
     #writer.add_hparams(hparam_dict=vars(args), metric_dict={"test_acc": test_acc})

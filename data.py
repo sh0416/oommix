@@ -1,5 +1,6 @@
 import os
 import csv
+from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
@@ -7,10 +8,9 @@ from tqdm import tqdm
 
 
 class ListDataset(Dataset):
-    def __init__(self, data, n_class, data_size):
+    def __init__(self, data, n_class):
         self.data = data
         self.n_class = n_class
-        self.data_size = data_size if data_size != -1 else len(self.data)
 
     def __getitem__(self, idx):
         data = self.data[idx]
@@ -18,7 +18,7 @@ class ListDataset(Dataset):
                 "label": torch.tensor(data["label"], dtype=torch.long)}
     
     def __len__(self):
-        return self.data_size
+        return len(self.data)
 
 
 def load_csv(filepath, fieldnames=None):
@@ -44,7 +44,7 @@ def preprocess(load_f, filepath, tokenizer):
     if not os.path.exists(cached_filepath):
         data = load_f(filepath)
         for row in tqdm(data, desc="Tokenize amazon text"):
-            row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=512, truncation=True)["input_ids"]))
+            row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=256, truncation=True)["input_ids"]))
         os.makedirs(os.path.dirname(cached_filepath), exist_ok=True)
         save_csv(cached_filepath, data, ["input", "label"])
     return [{"input": list(map(int, row["input"].split(' '))), "label": int(row["label"])}
@@ -52,12 +52,12 @@ def preprocess(load_f, filepath, tokenizer):
 
 
 def load_ag_news(filepath):
-    return [{"label": int(row["class"]) - 1, "input": row["title"]}
+    return [{"label": int(row["class"]) - 1, "input": row["description"]}
             for row in tqdm(load_csv(filepath, ["class", "title", "description"]), desc="Load ag news dataset")]
 
 
 def load_yahoo_answer(filepath):
-    return [{"label": int(row["class"]) - 1, "input": row["title"]}
+    return [{"label": int(row["class"]) - 1, "input": row["title"] + ' ' + row["content"] + ' ' + row["answer"]}
             for row in tqdm(load_csv(filepath, ["class", "title", "content", "answer"]), desc="Load yahoo dataset")]
 
 
@@ -72,13 +72,15 @@ def load_yelp_polarity(filepath):
     return data
 
 
-def create_dataset(dataset, filepath, tokenizer, num_train_data=-1):
+def create_dataset(dataset, dirpath, tokenizer, num_train_data=-1):
     if dataset == "ag_news":
         data_load_func = load_ag_news
         n_class = 4
+        num_valid_data = 1900 * n_class
     elif dataset == "yahoo_answer":
         data_load_func = load_yahoo_answer
         n_class = 10
+        num_valid_data = 5000 * n_class
     elif dataset == "amazon_review_full":
         data_load_func = load_amazon_review_full
         n_class = 5
@@ -87,9 +89,18 @@ def create_dataset(dataset, filepath, tokenizer, num_train_data=-1):
         n_class = 2
     else:
         raise AttributeError("Invalid dataset")
-    data = preprocess(data_load_func, filepath, tokenizer)
-    return ListDataset(data, n_class, num_train_data)
-    
+    train_data = preprocess(data_load_func, os.path.join(dirpath, "train.csv"), tokenizer)
+    test_data = preprocess(data_load_func, os.path.join(dirpath, "test.csv"), tokenizer)
+    # Stratified split
+    train_data, valid_data = train_test_split(train_data, test_size=num_valid_data, random_state=42,
+                                              shuffle=True, stratify=[x["label"] for x in train_data])
+    if num_train_data != -1:
+        _, train_data = train_test_split(train_data, test_size=num_train_data, random_state=42,
+                                         shuffle=True, stratify=[x["label"] for x in train_data])
+    train_dataset = ListDataset(train_data, n_class)
+    valid_dataset = ListDataset(valid_data, n_class)
+    test_dataset = ListDataset(test_data, n_class)
+    return train_dataset, valid_dataset, test_dataset
     
 
 class CollateFn:

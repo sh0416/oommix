@@ -33,7 +33,6 @@ class Bert(nn.Module):
                  n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, n_class=4):
         super().__init__()
         self.word_embeddings = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
-        self.word_embeddings.weight.requires_grad_(False)
         self.position_embeddings = nn.Embedding(max_length, embed_dim, padding_idx=padding_idx)
         self.token_type_embeddings = nn.Embedding(2, embed_dim)
         self.embedding_norm = nn.LayerNorm(embed_dim, eps=1e-12)
@@ -62,8 +61,7 @@ class Bert(nn.Module):
 
     def forward(self, input_ids, attention_mask):
         batch, seq_len = input_ids.shape
-        with torch.no_grad():
-            h = self.forward_embedding(input_ids, batch, seq_len)
+        h = self.forward_embedding(input_ids, batch, seq_len)
         for i, module_dict in enumerate(self.encoder):
             h = self.forward_layer(h, attention_mask, module_dict, batch, seq_len)
         return h
@@ -245,7 +243,7 @@ class ProposedMixSentenceClassificationModel(nn.Module):
         self.classifier = nn.Linear(self.mix_model.embedding_model.embed_dim, n_class)
 
     def forward(self, input_ids, attention_mask, idx=None, mixup_indices=None, lambda_=None):
-        h = self.mix_model(input_ids, attention_mask, idx=idx, mixup_indices=mixup_indices, lambda_=1)
+        h = self.mix_model(input_ids, attention_mask, idx=idx, mixup_indices=mixup_indices, lambda_=lambda_)
         self.h = h
         if idx is not None:
             attention_mask = torch.gather(attention_mask, dim=1, index=idx)
