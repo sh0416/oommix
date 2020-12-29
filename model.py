@@ -61,7 +61,8 @@ class Bert(nn.Module):
 
     def forward(self, input_ids, attention_mask):
         batch, seq_len = input_ids.shape
-        h = self.forward_embedding(input_ids, batch, seq_len)
+        with torch.no_grad():
+            h = self.forward_embedding(input_ids, batch, seq_len)
         for i, module_dict in enumerate(self.encoder):
             h = self.forward_layer(h, attention_mask, module_dict, batch, seq_len)
         return h
@@ -137,13 +138,14 @@ class ProposedMix(nn.Module):
         batch, seq_len = input_ids.shape
         with torch.no_grad():
             h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
-            if idx is not None:
-                h = torch.gather(h, dim=1, index=idx[:, :, None].expand(-1, -1, h.shape[2]))
-                attention_mask = torch.gather(attention_mask, dim=1, index=idx)
         for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
             h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
         if mixup_indices is not None:
-            h = lambda_ * h + (1 - lambda_) * h[mixup_indices]
+            if idx is not None:
+                h = torch.gather(h, dim=1, index=idx[:, :, None].expand(-1, -1, h.shape[2]))
+                attention_mask = torch.gather(attention_mask, dim=1, index=idx)
+            mix_h = torch.where(attention_mask[:, :, None], h[mixup_indices], h)
+            h = lambda_ * h + (1 - lambda_) * mix_h
         for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
             h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
         return h

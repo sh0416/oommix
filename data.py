@@ -1,5 +1,8 @@
 import os
 import csv
+import logging
+from collections import Counter
+import numpy as np
 from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
@@ -72,7 +75,7 @@ def load_yelp_polarity(filepath):
     return data
 
 
-def create_dataset(dataset, dirpath, tokenizer, num_train_data=-1):
+def create_metadata(dataset):
     if dataset == "ag_news":
         data_load_func = load_ag_news
         n_class = 4
@@ -89,19 +92,69 @@ def create_dataset(dataset, dirpath, tokenizer, num_train_data=-1):
         n_class = 2
     else:
         raise AttributeError("Invalid dataset")
+    return data_load_func, n_class, num_valid_data
+
+
+def augment_data(data, split_num, reflection):
+    pair_frequency = Counter()
+    for row in data:
+        pair_frequency.update(zip(row['input'], row['input'][1:]))
+    pair_priority = {pair: i for i, (pair, count) in enumerate(pair_frequency.most_common())}
+    augmented_data = []
+    for row in tqdm(data):
+        pairs = list(zip(row['input'], row['input'][1:]))
+        priorities = list(map(lambda x: pair_priority[x], pairs))
+        rank = np.asarray(priorities).argsort()[::-1].argsort()
+        sublist, sid = [], 0
+        for eid, rank in enumerate(rank, start=1):
+            if rank < split_num:
+                sublist.append(row['input'][sid:eid])
+                sid = eid
+        for _ in range(reflection):
+            np.random.shuffle(sublist)
+            augmented_data.append(
+                {'input': [t for l in sublist for t in l],
+                 'label': row['label']}
+            )
+    return data + augmented_data
+
+
+def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-1, augment=False):
+    data_load_func, n_class, num_valid_data = create_metadata(dataset)
     train_data = preprocess(data_load_func, os.path.join(dirpath, "train.csv"), tokenizer)
-    test_data = preprocess(data_load_func, os.path.join(dirpath, "test.csv"), tokenizer)
     # Stratified split
     train_data, valid_data = train_test_split(train_data, test_size=num_valid_data, random_state=42,
                                               shuffle=True, stratify=[x["label"] for x in train_data])
+    # For only valid data, sort by length to accelerate inference
+    valid_data = sorted(valid_data, key=lambda x: len(x["input"]), reverse=True)
     if num_train_data != -1:
         _, train_data = train_test_split(train_data, test_size=num_train_data, random_state=42,
                                          shuffle=True, stratify=[x["label"] for x in train_data])
+
+    # If train data augment,
+    if augment == 'proposed':
+        train_data = augment_data(train_data, 10, 100)
+
+    # Calculate the observed token number
+    train_token = set(token for row in train_data for token in row["input"])
+    valid_token = set(token for row in valid_data for token in row["input"])
+    oov_token = valid_token - train_token
+    logging.info("Train observed token number: %d" % len(train_token))
+    logging.info("Valid observed token number: %d" % len(valid_token))
+    logging.info("Out of vocabulary token number: %d" % len(oov_token))
+    logging.info("Ouf of vocabulary rate: %.4f" % (len(oov_token) / len(valid_token)))
     train_dataset = ListDataset(train_data, n_class)
     valid_dataset = ListDataset(valid_data, n_class)
-    test_dataset = ListDataset(test_data, n_class)
-    return train_dataset, valid_dataset, test_dataset
+    return train_dataset, valid_dataset
     
+
+def create_test_dataset(dataset, dirpath, tokenizer):
+    data_load_func, n_class, _ = create_metadata(dataset)
+    test_data = preprocess(data_load_func, os.path.join(dirpath, "test.csv"), tokenizer)
+    test_data = sorted(test_data, key=lambda x: len(x["input"]), reverse=True)
+    test_dataset = ListDataset(test_data, n_class)
+    return test_dataset
+
 
 class CollateFn:
     def __init__(self, tokenizer):

@@ -14,7 +14,8 @@ import matplotlib
 import matplotlib.pyplot as plt
 from torchviz import make_dot
 
-from data import create_dataset, CollateFn
+from data import create_train_and_valid_dataset, CollateFn
+from data import create_test_dataset
 from model import create_model
 
 matplotlib.use('Agg')
@@ -24,7 +25,7 @@ matplotlib.use('Agg')
 config = BertConfig.from_pretrained("bert-base-uncased")
 print(config)
 
-def evaluate(model, loader, step):
+def evaluate(model, loader):
     with torch.no_grad():
         model.eval()
         correct, count = 0, 0
@@ -67,6 +68,7 @@ if __name__ == "__main__":
     os.makedirs("log", exist_ok=True)
     os.makedirs("ckpt", exist_ok=True)
     experiment_id = datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')
+    ckpt_fpath = os.path.join('ckpt', '%s_best.pt' % experiment_id)
     logging.basicConfig(handlers=[logging.StreamHandler(),
                                   logging.FileHandler(os.path.join('log', experiment_id))],
                         level=logging.INFO)
@@ -78,20 +80,25 @@ if __name__ == "__main__":
 
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
-    train_dataset, valid_dataset, test_dataset = create_dataset(
-        dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer, num_train_data=args.num_train_data)
+    train_dataset, valid_dataset = create_train_and_valid_dataset(
+        dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer, num_train_data=args.num_train_data,
+        augment=args.augment)
+    test_dataset = create_test_dataset(dataset=args.dataset,
+                                       dirpath=args.data_dir,
+                                       tokenizer=tokenizer)
     logging.info("Train data: %d" % (len(train_dataset)))
     logging.info("Valid data: %d" % (len(valid_dataset)))
     logging.info("Test data: %d" % (len(test_dataset)))
     collate_fn = CollateFn(tokenizer)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate_fn)
-    valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=True,
+    valid_loader = DataLoader(valid_dataset, batch_size=256, shuffle=False,
                               collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False,
+                             collate_fn=collate_fn)
 
     model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
-                         n_class=test_dataset.n_class, n_layer=6, drop_prob=args.drop_prob)
+                         n_class=train_dataset.n_class, n_layer=6, drop_prob=args.drop_prob)
     model.load()     # Load BERT pretrained weight
     #wandb.watch(model)
 
@@ -154,6 +161,11 @@ if __name__ == "__main__":
                     scaler.scale(loss).backward()
                     logging.info("Loss: %.4f" % loss.item())
                 elif args.augment == "proposed":
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    loss = criterion(outputs, labels)
+                    scaler.scale(loss).backward()
+                    print(model.mix_model.embedding_model.word_embeddings.weight.grad)
+                    """
                     mixup_indices = torch.randperm(input_ids.shape[0], device=device)
                     with torch.no_grad():
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, lambda_=1)
@@ -161,7 +173,6 @@ if __name__ == "__main__":
                         f = model.h  # [B, L, K]
                         class_score = torch.matmul(f, w.transpose(0, 1)) # [B, L, C]
                         class_score = torch.gather(class_score, dim=2, index=labels[:, None, None].expand(-1, class_score.shape[1], -1)).squeeze(2) # [B, L]
-                        """
                         example = list(zip(tokenizer.convert_ids_to_tokens(input_ids[0].detach().cpu().tolist()),
                                             class_score[0, :, labels[0]].cpu().tolist()))
                         example = [(idx, word, score) for idx, (word, score) in enumerate(example)]
@@ -169,7 +180,6 @@ if __name__ == "__main__":
                         logging.info("Sentence:")
                         for idx, word, score in example:
                             logging.info("Position: %d, Word: %s, Score: %.4f" % (idx, word, score))
-                        """
                         from model import masked_softmax
                         class_score = masked_softmax(class_score, mask=attention_mask, dim=1)
                         idx = torch.argsort(class_score, dim=1, descending=True)
@@ -178,6 +188,7 @@ if __name__ == "__main__":
                                     attention_mask=attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
                     loss = criterion(outputs, labels)
                     scaler.scale(loss).backward()
+                    """
                     logging.info("Loss: %.4f" % loss.item())
                 elif args.augment in ["tmix", "adamix"]:
                     mixup_indices = torch.randperm(input_ids.shape[0], device=device)
@@ -217,24 +228,27 @@ if __name__ == "__main__":
             step += 1
             if step % args.eval_every == 0:
                 logging.info("Evaluate model")
-                valid_acc = evaluate(model, valid_loader, step)
-                logging.info("Valid accuracy: %.4f" % (valid_acc))
+                valid_acc = evaluate(model, valid_loader)
                 if valid_acc > best_acc:
+                    logging.info("Best valid accuracy: %.4f" % (valid_acc))
                     best_acc = valid_acc
-                    #test_acc = evaluate(model, test_loader, step)
-                    #logging.info("Best valid accuracy! test accuracy: %.4f" % (test_acc))
                     torch.save({"epoch": epoch,
                                 "model": model.state_dict(),
                                 "optimizer": [optimizer.state_dict() for optimizer in optimizers],
                                 "scheduler": [scheduler.state_dict() for scheduler in schedulers]},
-                                os.path.join("ckpt", "%s_best.pt" % experiment_id))
+                                ckpt_fpath)
                     patience = 0
                 else:
+                    logging.info("Valid accuracy: %.4f" % (valid_acc))
                     patience += 1
-                    if patience == 10:
+                    if patience == 5:
                         break
-        if patience == 10:
+        if patience == 5:
             break
 
+    # Restore best valid parameter
+    checkpoint = torch.load(ckpt_fpath)
+    model.load_state_dict(checkpoint["model"])
+    logging.info("Test acc: %.4f" % (evaluate(model, test_loader)))
     #writer.add_hparams(hparam_dict=vars(args), metric_dict={"test_acc": test_acc})
     #writer.close()
