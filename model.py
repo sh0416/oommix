@@ -1,4 +1,5 @@
 import math
+import logging
 import torch
 import torch.nn as nn
 from transformers import BertModel
@@ -30,7 +31,7 @@ def masked_mean(vec, mask, dim, keepdim=False):
 
 class Bert(nn.Module):
     def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
-                 n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, n_class=4):
+                 n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12):
         super().__init__()
         self.word_embeddings = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
         self.position_embeddings = nn.Embedding(max_length, embed_dim, padding_idx=padding_idx)
@@ -78,17 +79,25 @@ class Bert(nn.Module):
         h = self.embedding_norm(word + position + token_type)
         return h
         
-    def forward_layer(self, h, attention_mask, module_dict, batch, seq_len):
+    def _multiheadattn(self, h, attention_mask, module_dict, batch, seq_len):
         q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
         k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
         v = module_dict["value"](h).view(batch, seq_len, self.n_head, self.v_dim)
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 3, 1)
-        a = torch.matmul(q, k) / math.sqrt(self.k_dim)
-        a = masked_softmax(a, attention_mask[:, None, None, :], dim=3)
+        q = q.permute(0, 2, 1, 3)  # [b, h, l, d]
+        k = k.permute(0, 2, 3, 1)  # [b, h, d, l]
+        a = torch.matmul(q, k) / math.sqrt(self.k_dim)                  # [b, h, l, l]
+        a = masked_softmax(a, attention_mask[:, None, None, :], dim=3)  # [b, h, l, l]
         o = torch.matmul(a, v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3).contiguous()
-        o = o.view(batch, seq_len, -1)  # [b, h, s, d]
-        h = module_dict["norm"](h + self.dropout(module_dict["out"](o)))
+        # [b, h, l, l] x [b, h, l, d] = [b, h, l, d] -> [b, l, h, d]
+        o = o.view(batch, seq_len, -1)          # [b, l, h*d]
+        o = self.dropout(module_dict["out"](o)) # [b, l, h*d]
+        logging.debug("The norm of vector before multihead attention: %.4f" % torch.norm(h, dim=2).mean())
+        logging.debug("The norm of vector after multihead attention: %.4f" % torch.norm(o, dim=2).mean())
+        h = module_dict["norm"](h + o)
+        return h
+
+    def forward_layer(self, h, attention_mask, module_dict, batch, seq_len):
+        h = self._multiheadattn(h, attention_mask, module_dict, batch, seq_len)
         h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
         return h
 
@@ -133,6 +142,10 @@ class ProposedMix(nn.Module):
         super().__init__()
         self.embedding_model = embedding_model
         self.mixup_layer = mixup_layer
+        self.memory_k = nn.Parameter(torch.zeros(10, self.embedding_model.embed_dim),
+                                     False)
+        self.memory_v = nn.Parameter(torch.zeros(10, self.embedding_model.embed_dim),
+                                     False)
 
     def forward(self, input_ids, attention_mask, idx=None, mixup_indices=None, lambda_=None):
         batch, seq_len = input_ids.shape
@@ -163,7 +176,8 @@ class AdaMix(nn.Module):
         self.policy_region_generator = nn.Sequential(
             nn.Linear(2*self.embedding_model.embed_dim, 128),
             nn.Tanh(),
-            nn.Linear(128, 3))
+            nn.Linear(128, 3),
+            nn.Softmax())
         self.mixup_layer = mixup_layer
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
@@ -175,24 +189,13 @@ class AdaMix(nn.Module):
         if mixup_indices is not None:
             # Policy Region Generator
             sentence_h = h.mean(dim=1)
-            policy_region = self.policy_region_generator(torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1))  # [B, 3]
-            policy_region = (policy_region - policy_region.min(dim=1, keepdim=True)[0])
-            policy_region = policy_region / policy_region.sum(dim=1, keepdim=True)
+            policy_region = self.policy_region_generator(
+                torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1))  # [B, 3]
             gamma = policy_region[:, 1] * eps + policy_region[:, 0]
-            #gamma.register_hook(print_gradient)
             mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
-            mix_h = torch.where(attention_mask[:, :, None], mix_h, h)
-            #print((mix_h[:, 0, :] - h[:, 0, :]).abs().max())
-            """
-            for i in range(mix_h.shape[0]):
-                print(mix_h[i, 0, :], h[i, 0, :])
-                diff = (mix_h[i, 0, :] - h[i, 0, :]).abs()
-                print(diff.max(), diff.argmax(), mix_h[i, 0, diff.argmax()], h[i, 0, diff.argmax()])
-                import pdb
-                pdb.set_trace()
-            """
-            assert (mix_h[:, 0, :] - h[:, 0, :]).abs().max() < 1e-6
-            #mix_h = mix_h / mix_h.norm(dim=2, keepdim=True) * h.norm(dim=2, keepdim=True)
+            mix_h = torch.where(
+                attention_mask[:, :, None] & attention_mask[mixup_indices, :, None],
+                mix_h, h)
 
         for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
             h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
@@ -212,7 +215,7 @@ class SentenceClassificationModel(nn.Module):
     def __init__(self, embedding_model, n_class):
         super().__init__()
         self.embedding_model = embedding_model
-        self.classifier = nn.Linear(embedding_model.embed_dim, n_class, bias=False)
+        self.classifier = nn.Linear(embedding_model.embed_dim, n_class)
 
     def forward(self, input_ids, attention_mask):
         h = self.embedding_model(input_ids, attention_mask)
@@ -267,7 +270,7 @@ class AdaMixSentenceClassificationModel(nn.Module):
         self.intrusion_classifier = nn.Sequential(
             nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
             nn.Tanh(),
-            nn.Linear(128, 1)
+            nn.Linear(128, 2)
         )
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
@@ -276,15 +279,15 @@ class AdaMixSentenceClassificationModel(nn.Module):
             return self.classifier(torch.mean(h, dim=1))
         else:
             h, mix_h, gamma = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
-            out = self.classifier(torch.mean(h, dim=1))
-            mix_out = self.classifier(masked_mean(mix_h, attention_mask, dim=1))
+            out = self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
+            mix_out = self.classifier(masked_mean(mix_h, attention_mask[:, :, None], dim=1))
             return out, mix_out, gamma
         
     def predict_intrusion(self, input_ids, attention_mask, mixup_indices, eps):
         h, mix_h, gamma = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
         # Intrusion Discriminator
-        intr = self.intrusion_classifier(torch.mean(h, dim=1))
-        mix_intr = self.intrusion_classifier(torch.mean(mix_h, dim=1))
+        intr = self.intrusion_classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
+        mix_intr = self.intrusion_classifier(masked_mean(mix_h, attention_mask[:, :, None], dim=1))
         return intr, mix_intr
 
     def load(self):

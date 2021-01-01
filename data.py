@@ -119,7 +119,7 @@ def augment_data(data, split_num, reflection):
     return data + augmented_data
 
 
-def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-1, augment=False):
+def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-1):
     data_load_func, n_class, num_valid_data = create_metadata(dataset)
     train_data = preprocess(data_load_func, os.path.join(dirpath, "train.csv"), tokenizer)
     # Stratified split
@@ -130,10 +130,6 @@ def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-
     if num_train_data != -1:
         _, train_data = train_test_split(train_data, test_size=num_train_data, random_state=42,
                                          shuffle=True, stratify=[x["label"] for x in train_data])
-
-    # If train data augment,
-    if augment == 'proposed':
-        train_data = augment_data(train_data, 10, 100)
 
     # Calculate the observed token number
     train_token = set(token for row in train_data for token in row["input"])

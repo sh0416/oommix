@@ -61,6 +61,7 @@ if __name__ == "__main__":
     parser.add_argument("--augment", type=str, choices=["none", "tmix", "adamix", "proposed"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=3)
     parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--save_every", type=int, default=500)
     parser.add_argument("--eval_every", type=int, default=500)
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
@@ -68,7 +69,6 @@ if __name__ == "__main__":
     os.makedirs("log", exist_ok=True)
     os.makedirs("ckpt", exist_ok=True)
     experiment_id = datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')
-    ckpt_fpath = os.path.join('ckpt', '%s_best.pt' % experiment_id)
     logging.basicConfig(handlers=[logging.StreamHandler(),
                                   logging.FileHandler(os.path.join('log', experiment_id))],
                         level=logging.INFO)
@@ -81,8 +81,8 @@ if __name__ == "__main__":
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
     train_dataset, valid_dataset = create_train_and_valid_dataset(
-        dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer, num_train_data=args.num_train_data,
-        augment=args.augment)
+        dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer,
+        num_train_data=args.num_train_data)
     test_dataset = create_test_dataset(dataset=args.dataset,
                                        dirpath=args.data_dir,
                                        tokenizer=tokenizer)
@@ -97,6 +97,7 @@ if __name__ == "__main__":
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False,
                              collate_fn=collate_fn)
 
+    print(train_dataset.n_class)
     model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
                          n_class=train_dataset.n_class, n_layer=6, drop_prob=args.drop_prob)
     model.load()     # Load BERT pretrained weight
@@ -161,10 +162,6 @@ if __name__ == "__main__":
                     scaler.scale(loss).backward()
                     logging.info("Loss: %.4f" % loss.item())
                 elif args.augment == "proposed":
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss = criterion(outputs, labels)
-                    scaler.scale(loss).backward()
-                    print(model.mix_model.embedding_model.word_embeddings.weight.grad)
                     """
                     mixup_indices = torch.randperm(input_ids.shape[0], device=device)
                     with torch.no_grad():
@@ -188,36 +185,44 @@ if __name__ == "__main__":
                                     attention_mask=attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
                     loss = criterion(outputs, labels)
                     scaler.scale(loss).backward()
-                    """
                     logging.info("Loss: %.4f" % loss.item())
-                elif args.augment in ["tmix", "adamix"]:
+                    """
+                elif args.augment == "tmix":
                     mixup_indices = torch.randperm(input_ids.shape[0], device=device)
-                    if args.augment in ["tmix"]:
-                        lambda_ = np.random.beta(args.alpha, args.alpha)
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
-                        loss1 = criterion(outputs, labels)
-                        loss2 = criterion(outputs, labels[mixup_indices])
-                        loss = lambda_ * loss1 + (1 - lambda_) * loss2
-                        scaler.scale(loss).backward()
-                        logging.info("[Epoch %d, Step %d] Lambda: %.4f, Loss1: %.4f, Loss2: %.4f, Loss: %.4f" % (epoch, step, lambda_, loss1, loss2, loss))
-                    elif args.augment in ["adamix"]:
-                        eps = torch.rand(input_ids.shape[0], device=input_ids.device)
-                        # Calculate gradient for normal classifier
-                        outs, mix_outs, gamma = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, eps=eps)
-                        loss1 = criterion(outs, labels).mean()
-                        loss2 = (gamma * criterion(mix_outs, labels) + (1 - gamma) * criterion(mix_outs, labels[mixup_indices])).mean()
-                        loss = (loss1 + loss2) / 2
-                        scaler.scale(loss).backward()
-                        # Calculate gradient for intrusion classifier
-                        for param in model.mix_model.embedding_model.parameters():
-                            param.requires_grad = False
-                        outs, mix_outs = model.predict_intrusion(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, eps=eps)
-                        intr_loss = criterion2(torch.cat((outs, mix_outs), dim=0),
-                                                torch.cat((torch.ones_like(outs), torch.zeros_like(mix_outs)), dim=0))
-                        scaler.scale(10*intr_loss).backward()
-                        for name, param in model.mix_model.embedding_model.named_parameters():
-                            if 'word' not in name:
-                                param.requires_grad = True
+                    lambda_ = np.random.beta(args.alpha, args.alpha)
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
+                    loss1 = criterion(outputs, labels)
+                    loss2 = criterion(outputs, labels[mixup_indices])
+                    loss = lambda_ * loss1 + (1 - lambda_) * loss2
+                    scaler.scale(loss).backward()
+                    logging.info("[Epoch %d, Step %d] Lambda: %.4f, Loss1: %.4f, Loss2: %.4f, Loss: %.4f" % (epoch, step, lambda_, loss1, loss2, loss))
+                elif args.augment == "adamix":
+                    mixup_indices = torch.randperm(input_ids.shape[0], device=device)
+                    eps = torch.rand(input_ids.shape[0], device=input_ids.device)
+                    # Calculate gradient for normal classifier
+                    outs, mix_outs, gamma = model(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, eps=eps)
+                    loss1 = criterion(outs, labels).mean()
+                    loss2 = (gamma * criterion(mix_outs, labels) + (1 - gamma) * criterion(mix_outs, labels[mixup_indices])).mean()
+                    loss = (loss1 + loss2) / 2
+                    scaler.scale(loss).backward()
+                    # Calculate gradient for intrusion classifier
+                    for param in model.mix_model.embedding_model.parameters():
+                        param.requires_grad = False
+                    outs, mix_outs = model.predict_intrusion(input_ids=input_ids, attention_mask=attention_mask, mixup_indices=mixup_indices, eps=eps)
+                    intr_loss = criterion2(torch.cat((outs, mix_outs), dim=0),
+                                            torch.cat((torch.ones_like(outs), torch.zeros_like(mix_outs)), dim=0))
+                    scaler.scale(10*intr_loss).backward()
+                    for name, param in model.mix_model.embedding_model.named_parameters():
+                        if 'word_embeddings' in name:
+                            continue
+                        if 'position_embeddings' in name:
+                            continue
+                        if 'token_type_embeddings' in name:
+                            continue
+                        if 'embedding_norm' in name:
+                            continue
+                        param.requires_grad = True
+                    logging.info("[Epoch %d, Step %d] Loss: %.4f, Intrusion loss: %.4f" % (epoch, step, loss, intr_loss))
             for optimizer in optimizers:
                 scaler.step(optimizer)
                 scaler.update()
@@ -226,6 +231,12 @@ if __name__ == "__main__":
             for optimizer in optimizers:
                 optimizer.zero_grad()
             step += 1
+            if step % args.save_every == 0:
+                torch.save({"epoch": epoch,
+                            "model": model.state_dict(),
+                            "optimizer": [optimizer.state_dict() for optimizer in optimizers],
+                            "scheduler": [scheduler.state_dict() for scheduler in schedulers]},
+                            os.path.join('ckpt', '%s_%05d.pt' % (experiment_id, step)))
             if step % args.eval_every == 0:
                 logging.info("Evaluate model")
                 valid_acc = evaluate(model, valid_loader)
@@ -236,7 +247,7 @@ if __name__ == "__main__":
                                 "model": model.state_dict(),
                                 "optimizer": [optimizer.state_dict() for optimizer in optimizers],
                                 "scheduler": [scheduler.state_dict() for scheduler in schedulers]},
-                                ckpt_fpath)
+                                os.path.join('ckpt', '%s_best.pt' % experiment_id))
                     patience = 0
                 else:
                     logging.info("Valid accuracy: %.4f" % (valid_acc))
@@ -247,7 +258,7 @@ if __name__ == "__main__":
             break
 
     # Restore best valid parameter
-    checkpoint = torch.load(ckpt_fpath)
+    checkpoint = torch.load(os.path.join('ckpt', '%s_best.pt' % experiment_id))
     model.load_state_dict(checkpoint["model"])
     logging.info("Test acc: %.4f" % (evaluate(model, test_loader)))
     #writer.add_hparams(hparam_dict=vars(args), metric_dict={"test_acc": test_acc})
