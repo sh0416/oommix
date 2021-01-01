@@ -43,7 +43,7 @@ def get_cached_filepath(filepath):
 
 
 def preprocess(load_f, filepath, tokenizer):
-    cached_filepath = os.path.join('cache', 'cache_'+filepath)
+    cached_filepath = os.path.join("/data/sh0416/cache", 'cache_'+filepath)
     if not os.path.exists(cached_filepath):
         data = load_f(filepath)
         for row in tqdm(data, desc="Tokenize amazon text"):
@@ -155,9 +155,9 @@ def create_test_dataset(dataset, dirpath, tokenizer):
 class CollateFn:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        print("Special token %s: %d" % (self.tokenizer.cls_token, self.tokenizer.cls_token_id))
-        print("Special token %s: %d" % (self.tokenizer.sep_token, self.tokenizer.sep_token_id))
-        print("Special token %s: %d" % (self.tokenizer.pad_token, self.tokenizer.pad_token_id))
+        logging.info("Special token %s: %d" % (self.tokenizer.cls_token, self.tokenizer.cls_token_id))
+        logging.info("Special token %s: %d" % (self.tokenizer.sep_token, self.tokenizer.sep_token_id))
+        logging.info("Special token %s: %d" % (self.tokenizer.pad_token, self.tokenizer.pad_token_id))
 
     def __call__(self, batch):
         inputs = {}

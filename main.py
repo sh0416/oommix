@@ -23,9 +23,8 @@ matplotlib.use('Agg')
 #wandb.init(project='pdistmix')
 
 config = BertConfig.from_pretrained("bert-base-uncased")
-print(config)
 
-def evaluate(model, loader):
+def evaluate(model, loader, device):
     with torch.no_grad():
         model.eval()
         correct, count = 0, 0
@@ -39,7 +38,8 @@ def evaluate(model, loader):
             count += labels.shape[0]
         acc = correct / count
         model.train()
-    return acc
+    return acc.item()
+
 
 
 if __name__ == "__main__":
@@ -146,7 +146,7 @@ if __name__ == "__main__":
     logging.info("Hyperparameter")
     for k, v in vars(args).items():
         logging.info("%s = %s" % (str(k), str(v)))
-    
+
     for optimizer in optimizers:
         optimizer.zero_grad()
     for epoch in range(1, args.epoch+1):
