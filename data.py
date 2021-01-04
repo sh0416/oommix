@@ -79,8 +79,7 @@ def create_metadata(dataset):
     if dataset == "ag_news":
         data_load_func = load_ag_news
         n_class = 4
-        #num_valid_data = 1900 * n_class
-        num_valid_data = 500 * n_class
+        num_valid_data = 1900 * n_class
     elif dataset == "yahoo_answer":
         data_load_func = load_yahoo_answer
         n_class = 10

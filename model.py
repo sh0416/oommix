@@ -215,7 +215,11 @@ class SentenceClassificationModel(nn.Module):
     def __init__(self, embedding_model, n_class):
         super().__init__()
         self.embedding_model = embedding_model
-        self.classifier = nn.Linear(embedding_model.embed_dim, n_class)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.embedding_model.embed_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, n_class)
+        )
 
     def forward(self, input_ids, attention_mask):
         h = self.embedding_model(input_ids, attention_mask)
@@ -230,7 +234,11 @@ class TMixSentenceClassificationModel(nn.Module):
     def __init__(self, mix_model, n_class):
         super().__init__()
         self.mix_model = mix_model
-        self.classifier = nn.Linear(self.mix_model.embedding_model.embed_dim, n_class)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, n_class)
+        )
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
         h = self.mix_model(input_ids, attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
@@ -281,15 +289,11 @@ class AdaMixSentenceClassificationModel(nn.Module):
             h, mix_h, gamma = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
             out = self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
             mix_out = self.classifier(masked_mean(mix_h, attention_mask[:, :, None], dim=1))
-            return out, mix_out, gamma
+            # Intrusion Discriminator
+            intr = self.intrusion_classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
+            mix_intr = self.intrusion_classifier(masked_mean(mix_h, attention_mask[:, :, None], dim=1))
+            return out, mix_out, intr, mix_intr, gamma
         
-    def predict_intrusion(self, input_ids, attention_mask, mixup_indices, eps):
-        h, mix_h, gamma = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
-        # Intrusion Discriminator
-        intr = self.intrusion_classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
-        mix_intr = self.intrusion_classifier(masked_mean(mix_h, attention_mask[:, :, None], dim=1))
-        return intr, mix_intr
-
     def load(self):
         self.mix_model.embedding_model.load()
 
