@@ -1,2 +1,9 @@
 runs/
 dataset/
+wandb/
+__pycache__/
+.ipynb_checkpoints/
+.vscode/
+cache/
+log/
+ckpt/
