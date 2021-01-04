@@ -17,7 +17,8 @@ class ListDataset(Dataset):
 
     def __getitem__(self, idx):
         data = self.data[idx]
-        return {"input": torch.tensor(data["input"], dtype=torch.long),
+        return {"idx": idx,
+                "input": torch.tensor(data["input"], dtype=torch.long),
                 "label": torch.tensor(data["label"], dtype=torch.long)}
     
     def __len__(self):
@@ -162,16 +163,19 @@ class CollateFn:
     def __call__(self, batch):
         inputs = {}
         with torch.no_grad():
+            idx = torch.tensor([x["idx"] for x in batch], dtype=torch.long)
             inputs["input_ids"] = nn.utils.rnn.pad_sequence([x["input"] for x in batch],
                                                             batch_first=True,
                                                             padding_value=self.tokenizer.pad_token_id)
             inputs["attention_mask"] = inputs["input_ids"] != self.tokenizer.pad_token_id
+            """
             inputs["mixup_mask"] = {
                     "is_cls": (inputs["input_ids"] == self.tokenizer.cls_token_id),
                     "is_sep": (inputs["input_ids"] == self.tokenizer.sep_token_id),
                     "is_normal": ((inputs["input_ids"] != self.tokenizer.cls_token_id) & \
                                   (inputs["input_ids"] != self.tokenizer.sep_token_id) & \
                                   (inputs["input_ids"] != self.tokenizer.pad_token_id))}
+            """
             labels = torch.stack([x["label"] for x in batch])
-        return {"inputs": inputs, "labels": labels}
+        return {"idx": idx, "inputs": inputs, "labels": labels}
 
