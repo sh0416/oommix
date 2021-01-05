@@ -154,11 +154,13 @@ def create_test_dataset(dataset, dirpath, tokenizer):
 
 
 class CollateFn:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, max_length):
         self.tokenizer = tokenizer
+        self.max_length = max_length
         logging.info("Special token %s: %d" % (self.tokenizer.cls_token, self.tokenizer.cls_token_id))
         logging.info("Special token %s: %d" % (self.tokenizer.sep_token, self.tokenizer.sep_token_id))
         logging.info("Special token %s: %d" % (self.tokenizer.pad_token, self.tokenizer.pad_token_id))
+        logging.info("Max length: %d" % max_length)
 
     def __call__(self, batch):
         inputs = {}
@@ -167,6 +169,8 @@ class CollateFn:
             inputs["input_ids"] = nn.utils.rnn.pad_sequence([x["input"] for x in batch],
                                                             batch_first=True,
                                                             padding_value=self.tokenizer.pad_token_id)
+            if inputs["input_ids"].shape[1] > self.max_length:
+                inputs["input_ids"] = inputs["input_ids"][:, :self.max_length]
             inputs["attention_mask"] = inputs["input_ids"] != self.tokenizer.pad_token_id
             """
             inputs["mixup_mask"] = {

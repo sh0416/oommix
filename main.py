@@ -14,6 +14,7 @@ from transformers import BertModel, BertConfig, BertTokenizerFast
 import matplotlib
 import matplotlib.pyplot as plt
 from torchviz import make_dot
+from tqdm import tqdm
 
 from data import create_train_and_valid_dataset, CollateFn
 from data import create_test_dataset
@@ -70,7 +71,7 @@ def evaluate(model, loader, device):
     with torch.no_grad():
         model.eval()
         correct, count = 0, 0
-        for batch in loader:
+        for batch in tqdm(loader):
             input_ids = batch["inputs"]["input_ids"].to(device) 
             attention_mask = batch["inputs"]["attention_mask"].to(device) 
             labels = batch["labels"].to(device)
@@ -91,7 +92,7 @@ def train(args, report_func=None):
         num_train_data=args.num_train_data)
 
     # Loader
-    collate_fn = CollateFn(tokenizer)
+    collate_fn = CollateFn(tokenizer, args.max_length)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate_fn)
     valid_loader = DataLoader(valid_dataset, batch_size=256, shuffle=False,
@@ -174,12 +175,12 @@ def train(args, report_func=None):
                     torch.save(model.state_dict(), "./model.pth")
                 else:
                     patience += 1
-                    if patience == 5:
+                    if patience == args.patience:
                         break
                 logging.info("Accuracy: %.4f, Best accuracy: %.4f" % (acc, best_acc))
                 if report_func is not None:
                     report_func(accuracy=acc, best_accuracy=best_acc)
-        if patience == 5:
+        if patience == args.patience:
             break
 
 
@@ -191,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--dataset", type=str, choices=["ag_news", "yahoo_answer"], default="ag_news")
     parser.add_argument("--num_train_data", type=int, default=-1, help="Number of train dataset. Use first `num_train` row. -1 means whole dataset")
+    parser.add_argument("--max_length", type=int, default=256)
     # Model hyperparameter
     parser.add_argument("--restore", type=str)
     # Train hyperparameter
@@ -205,17 +207,18 @@ if __name__ == "__main__":
     parser.add_argument("--coeff_intr", type=float, default=0.5)
     parser.add_argument("--save_every", type=int, default=500)
     parser.add_argument("--eval_every", type=int, default=500)
+    parser.add_argument("--patience", type=int, default=5)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
     train(args)
 
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
     test_dataset = create_test_dataset(dataset=args.dataset,
                                        dirpath=args.data_dir,
                                        tokenizer=tokenizer)
-    collate_fn = CollateFn(tokenizer)
+    collate_fn = CollateFn(tokenizer, args.max_length)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False,
                              collate_fn=collate_fn)
 
