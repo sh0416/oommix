@@ -29,6 +29,33 @@ def masked_mean(vec, mask, dim, keepdim=False):
     return masked_sum(vec, mask, dim, keepdim) / torch.sum(mask.float(), dim=dim, keepdim=keepdim)
 
 
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, embed_dim, n_head, k_dim, v_dim):
+        super().__init__()
+        self.n_head = n_head
+        self.k_dim = k_dim
+        self.v_dim = v_dim
+        self.query = nn.Linear(embed_dim, n_head * k_dim)
+        self.key = nn.Linear(embed_dim, n_head * k_dim)
+        self.value = nn.Linear(embed_dim, n_head * v_dim)
+        self.out = nn.Linear(n_head * v_dim, embed_dim)
+    
+    def forward(self, h, attention_mask):
+        batch, seq_len, _ = h.shape
+        q = self.query(h).view(batch, seq_len, self.n_head, self.k_dim)
+        k = self.key(h).view(batch, seq_len, self.n_head, self.k_dim)
+        v = self.value(h).view(batch, seq_len, self.n_head, self.v_dim)
+        q = q.permute(0, 2, 1, 3)  # [b, h, l, d]
+        k = k.permute(0, 2, 3, 1)  # [b, h, d, l]
+        a = torch.matmul(q, k) / math.sqrt(self.k_dim)                  # [b, h, l, l]
+        a = masked_softmax(a, attention_mask[:, None, None, :], dim=3)  # [b, h, l, l]
+        o = torch.matmul(a, v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3).contiguous()
+        # [b, h, l, l] x [b, h, l, d] = [b, h, l, d] -> [b, l, h, d]
+        o = o.view(batch, seq_len, -1)          # [b, l, h*d]
+        o = self.out(o)                         # [b, l, h*d]
+        return o, a
+
+
 class Bert(nn.Module):
     def __init__(self, vocab_size=30522, embed_dim=768, padding_idx=0, max_length=512, drop_prob=0.1,
                  n_head=12, k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12):
@@ -39,10 +66,7 @@ class Bert(nn.Module):
         self.embedding_norm = nn.LayerNorm(embed_dim, eps=1e-12)
         self.encoder = nn.ModuleList([
             nn.ModuleDict({
-                "query": nn.Linear(embed_dim, n_head * k_dim),
-                "key": nn.Linear(embed_dim, n_head * k_dim),
-                "value": nn.Linear(embed_dim, n_head * v_dim),
-                "out": nn.Linear(n_head * v_dim, embed_dim),
+                "mhsa": MultiHeadSelfAttention(embed_dim, n_head, k_dim, v_dim),
                 "norm": nn.LayerNorm(embed_dim, eps=1e-12),
                 "ff": nn.Sequential(
                     nn.Linear(embed_dim, feedforward_dim),
@@ -61,14 +85,14 @@ class Bert(nn.Module):
         self.embed_dim = embed_dim
 
     def forward(self, input_ids, attention_mask):
-        batch, seq_len = input_ids.shape
         with torch.no_grad():
-            h = self.forward_embedding(input_ids, batch, seq_len)
+            h = self.forward_embedding(input_ids)
         for i, module_dict in enumerate(self.encoder):
-            h = self.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self.forward_layer(h, attention_mask, module_dict)
         return h
 
-    def forward_embedding(self, input_ids, batch, seq_len):
+    def forward_embedding(self, input_ids):
+        batch, seq_len = input_ids.shape
         word = self.word_embeddings(input_ids)
         position_ids = torch.arange(0, seq_len, device=input_ids.device)
         position_ids = position_ids[None, :].expand(batch, -1)
@@ -79,25 +103,8 @@ class Bert(nn.Module):
         h = self.embedding_norm(word + position + token_type)
         return h
         
-    def _multiheadattn(self, h, attention_mask, module_dict, batch, seq_len):
-        q = module_dict["query"](h).view(batch, seq_len, self.n_head, self.k_dim)
-        k = module_dict["key"](h).view(batch, seq_len, self.n_head, self.k_dim)
-        v = module_dict["value"](h).view(batch, seq_len, self.n_head, self.v_dim)
-        q = q.permute(0, 2, 1, 3)  # [b, h, l, d]
-        k = k.permute(0, 2, 3, 1)  # [b, h, d, l]
-        a = torch.matmul(q, k) / math.sqrt(self.k_dim)                  # [b, h, l, l]
-        a = masked_softmax(a, attention_mask[:, None, None, :], dim=3)  # [b, h, l, l]
-        o = torch.matmul(a, v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3).contiguous()
-        # [b, h, l, l] x [b, h, l, d] = [b, h, l, d] -> [b, l, h, d]
-        o = o.view(batch, seq_len, -1)          # [b, l, h*d]
-        o = self.dropout(module_dict["out"](o)) # [b, l, h*d]
-        logging.debug("The norm of vector before multihead attention: %.4f" % torch.norm(h, dim=2).mean())
-        logging.debug("The norm of vector after multihead attention: %.4f" % torch.norm(o, dim=2).mean())
-        h = module_dict["norm"](h + o)
-        return h
-
-    def forward_layer(self, h, attention_mask, module_dict, batch, seq_len):
-        h = self._multiheadattn(h, attention_mask, module_dict, batch, seq_len)
+    def forward_layer(self, h, attention_mask, module_dict):
+        h = module_dict["norm"](h + self.dropout(module_dict["mhsa"](h, attention_mask)[0]))
         h = module_dict["ff_norm"](h + self.dropout(module_dict["ff"](h)))
         return h
 
@@ -108,10 +115,10 @@ class Bert(nn.Module):
         self.token_type_embeddings.load_state_dict(model.embeddings.token_type_embeddings.state_dict())
         self.embedding_norm.load_state_dict(model.embeddings.LayerNorm.state_dict())
         for t, f in zip(self.encoder, model.encoder.layer):
-            t["query"].load_state_dict(f.attention.self.query.state_dict())
-            t["key"].load_state_dict(f.attention.self.key.state_dict())
-            t["value"].load_state_dict(f.attention.self.value.state_dict())
-            t["out"].load_state_dict(f.attention.output.dense.state_dict())
+            t["mhsa"].query.load_state_dict(f.attention.self.query.state_dict())
+            t["mhsa"].key.load_state_dict(f.attention.self.key.state_dict())
+            t["mhsa"].value.load_state_dict(f.attention.self.value.state_dict())
+            t["mhsa"].out.load_state_dict(f.attention.output.dense.state_dict())
             t["norm"].load_state_dict(f.attention.output.LayerNorm.state_dict())
             t["ff"][0].load_state_dict(f.intermediate.dense.state_dict())
             t["ff"][2].load_state_dict(f.output.dense.state_dict())
@@ -125,15 +132,14 @@ class TMix(nn.Module):
         self.mixup_layer = mixup_layer
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
-        batch, seq_len = input_ids.shape
         with torch.no_grad():
-            h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
+            h = self.embedding_model.forward_embedding(input_ids)
         for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
         if mixup_indices is not None:
             h = lambda_ * h + (1 - lambda_) * h[mixup_indices]
         for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
         return h
 
 
@@ -144,11 +150,10 @@ class ShuffleMix(nn.Module):
         self.mixup_layer = mixup_layer
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
-        batch, seq_len = input_ids.shape
         with torch.no_grad():
-            h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
+            h = self.embedding_model.forward_embedding(input_ids)
         for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
         if mixup_indices is not None:
             h2, attention_mask2 = h[mixup_indices], attention_mask[mixup_indices]
             # Shuffle row-wise. To avoid non zero probability for padding mask, we add epsilon
@@ -161,7 +166,7 @@ class ShuffleMix(nn.Module):
             h = torch.where(attention_mask[:, :, None],
                             lambda_ * h + (1 - lambda_) * h2, h)
         for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
         return h
 
 
@@ -176,11 +181,10 @@ class ProposedMix(nn.Module):
                                      False)
 
     def forward(self, input_ids, attention_mask, idx=None, mixup_indices=None, lambda_=None):
-        batch, seq_len = input_ids.shape
         with torch.no_grad():
-            h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
+            h = self.embedding_model.forward_embedding(input_ids)
         for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
         if mixup_indices is not None:
             if idx is not None:
                 h = torch.gather(h, dim=1, index=idx[:, :, None].expand(-1, -1, h.shape[2]))
@@ -188,7 +192,7 @@ class ProposedMix(nn.Module):
             mix_h = torch.where(attention_mask[:, :, None], h[mixup_indices], h)
             h = lambda_ * h + (1 - lambda_) * mix_h
         for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
         return h
 
 
@@ -204,11 +208,10 @@ class AdaMix(nn.Module):
         self.mixup_layer = mixup_layer
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
-        batch, seq_len = input_ids.shape
         with torch.no_grad():
-            h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
+            h = self.embedding_model.forward_embedding(input_ids)
         for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
         if mixup_indices is not None:
             # Policy Region Generator
             sentence_h = h.mean(dim=1)
@@ -216,14 +219,12 @@ class AdaMix(nn.Module):
                 torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1))  # [B, 3]
             gamma = policy_region[:, 1] * eps + policy_region[:, 0]
             mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
-            mix_h = torch.where(
-                attention_mask[:, :, None] & attention_mask[mixup_indices, :, None],
-                mix_h, h)
-
+            mix_h = torch.where(attention_mask[:, :, None] & attention_mask[mixup_indices, :, None],
+                                mix_h, h)
         for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
             if mixup_indices is not None:
-                mix_h = self.embedding_model.forward_layer(mix_h, attention_mask, module_dict, batch, seq_len)
+                mix_h = self.embedding_model.forward_layer(mix_h, attention_mask, module_dict)
 
         if mixup_indices is None:
             return h
