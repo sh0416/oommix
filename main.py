@@ -1,5 +1,7 @@
 import os
 import sys
+import json
+import uuid
 import logging
 import argparse
 from datetime import datetime
@@ -117,6 +119,9 @@ def train(args, report_func=None):
     elif args.augment == "tmix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
+    elif args.augment == "shufflemix":
+        optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
+                      optim.Adam(model.classifier.parameters(), lr=1e-3)]
     elif args.augment == "adamix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
                       optim.Adam(model.mix_model.policy_region_generator.parameters(), lr=1e-3),
@@ -141,6 +146,10 @@ def train(args, report_func=None):
                                              epoch, step)
                 loss.backward()
             elif args.augment == "tmix":
+                loss = calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels,
+                                           args.alpha, epoch, step)
+                loss.backward()
+            elif args.augment == "shufflemix":
                 loss = calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels,
                                            args.alpha, epoch, step)
                 loss.backward()
@@ -172,7 +181,8 @@ def train(args, report_func=None):
                 if best_acc < acc:
                     best_acc = acc
                     patience = 0
-                    torch.save(model.state_dict(), "./model.pth")
+                    os.makedirs("ckpt", exist_ok=True)
+                    torch.save(model.state_dict(), os.path.join("ckpt", "./model_%s.pth" % args.exp_id))
                 else:
                     patience += 1
                     if patience == args.patience:
@@ -201,7 +211,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--drop_prob", type=float, default=0.1)
     # Train hyperparameter - augmentation
-    parser.add_argument("--augment", type=str, choices=["none", "tmix", "adamix", "proposed"], default="none")
+    parser.add_argument("--augment", type=str, choices=["none", "tmix", "shufflemix", "adamix"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=3)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--coeff_intr", type=float, default=0.5)
@@ -209,6 +219,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval_every", type=int, default=500)
     parser.add_argument("--patience", type=int, default=5)
     args = parser.parse_args()
+    args.exp_id = str(uuid.uuid4())[:8]
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
@@ -226,11 +238,14 @@ if __name__ == "__main__":
     model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
                          n_class=test_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
     model.to(device)
-    model.load_state_dict(torch.load("./model.pth"))
+    model.load_state_dict(torch.load(os.path.join("ckpt", "model_%s.pth" % args.exp_id)))
 
     test_acc = evaluate(model, test_loader, device)
     logging.info("Test accuracy: %.4f" % test_acc)
 
+    os.makedirs("param", exist_ok=True)
+    with open(os.path.join("param", args.exp_id+".json"), 'w') as f:
+        json.dump(vars(args), f, indent=2)
 
 def train_old(args):
     os.makedirs("log", exist_ok=True)

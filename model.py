@@ -137,6 +137,34 @@ class TMix(nn.Module):
         return h
 
 
+class ShuffleMix(nn.Module):
+    def __init__(self, embedding_model, mixup_layer=0):
+        super().__init__()
+        self.embedding_model = embedding_model
+        self.mixup_layer = mixup_layer
+
+    def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
+        batch, seq_len = input_ids.shape
+        with torch.no_grad():
+            h = self.embedding_model.forward_embedding(input_ids, batch, seq_len)
+        for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+        if mixup_indices is not None:
+            h2, attention_mask2 = h[mixup_indices], attention_mask[mixup_indices]
+            # Shuffle row-wise. To avoid non zero probability for padding mask, we add epsilon
+            sequence_indices = torch.multinomial(attention_mask2.float()+1e-7,
+                                                 num_samples=attention_mask2.shape[1],
+                                                 replacement=True)
+            h2 = torch.gather(h2, dim=1, index=sequence_indices[:, :, None].expand(-1, -1, h2.shape[2]))
+            #h = torch.where(attention_mask[:, :, None] & attention_mask2[:, :, None],
+            #                lambda_ * h + (1 - lambda_) * h2, h)
+            h = torch.where(attention_mask[:, :, None],
+                            lambda_ * h + (1 - lambda_) * h2, h)
+        for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
+            h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
+        return h
+
+
 class ProposedMix(nn.Module):
     def __init__(self, embedding_model, mixup_layer=0):
         super().__init__()
@@ -162,11 +190,6 @@ class ProposedMix(nn.Module):
         for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
             h = self.embedding_model.forward_layer(h, attention_mask, module_dict, batch, seq_len)
         return h
-
-
-def print_gradient(grad):
-    wandb.log({"Gamma gradient": grad.detach()})
-    #print(grad)
 
 
 class AdaMix(nn.Module):
@@ -211,15 +234,15 @@ class AdaMix(nn.Module):
         return super().forward(input_ids=input_ids, attention_mask=attention_mask)
 
 
+def create_sentence_classifier(embed_dim, n_class):
+    return nn.Sequential(nn.Linear(embed_dim, 128), nn.Tanh(), nn.Linear(128, n_class))
+
+
 class SentenceClassificationModel(nn.Module):
     def __init__(self, embedding_model, n_class):
         super().__init__()
         self.embedding_model = embedding_model
-        self.classifier = nn.Sequential(
-            nn.Linear(self.embedding_model.embed_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, n_class)
-        )
+        self.classifier = create_sentence_classifier(embedding_model.embed_dim, n_class)
 
     def forward(self, input_ids, attention_mask):
         h = self.embedding_model(input_ids, attention_mask)
@@ -234,32 +257,24 @@ class TMixSentenceClassificationModel(nn.Module):
     def __init__(self, mix_model, n_class):
         super().__init__()
         self.mix_model = mix_model
-        self.classifier = nn.Sequential(
-            nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, n_class)
-        )
+        self.classifier = create_sentence_classifier(mix_model.embedding_model.embed_dim, n_class)
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
         h = self.mix_model(input_ids, attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
-        self.h = h
         return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
 
     def load(self):
         self.mix_model.embedding_model.load()
 
 
-class ProposedMixSentenceClassificationModel(nn.Module):
+class ShuffleMixSentenceClassificationModel(nn.Module):
     def __init__(self, mix_model, n_class):
         super().__init__()
         self.mix_model = mix_model
-        self.classifier = nn.Linear(self.mix_model.embedding_model.embed_dim, n_class)
+        self.classifier = create_sentence_classifier(mix_model.embedding_model.embed_dim, n_class)
 
-    def forward(self, input_ids, attention_mask, idx=None, mixup_indices=None, lambda_=None):
-        h = self.mix_model(input_ids, attention_mask, idx=idx, mixup_indices=mixup_indices, lambda_=lambda_)
-        self.h = h
-        if idx is not None:
-            attention_mask = torch.gather(attention_mask, dim=1, index=idx)
+    def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
+        h = self.mix_model(input_ids, attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
         return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
 
     def load(self):
@@ -270,11 +285,7 @@ class AdaMixSentenceClassificationModel(nn.Module):
     def __init__(self, mix_model, n_class):
         super().__init__()
         self.mix_model = mix_model
-        self.classifier = nn.Sequential(
-            nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, n_class)
-        )
+        self.classifier = create_sentence_classifier(mix_model.embedding_model.embed_dim, n_class)
         self.intrusion_classifier = nn.Sequential(
             nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
             nn.Tanh(),
@@ -306,12 +317,12 @@ def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, 
                            feedforward_dim=feedforward_dim, n_layer=n_layer)
     if augment == "none":
         model = SentenceClassificationModel(embedding_model, n_class)
-    elif augment == "proposed":
-        embedding_model = ProposedMix(embedding_model, mixup_layer=mixup_layer)
-        model = ProposedMixSentenceClassificationModel(embedding_model, n_class)
     elif augment == "tmix":
         embedding_model = TMix(embedding_model, mixup_layer=mixup_layer)
         model = TMixSentenceClassificationModel(embedding_model, n_class)
+    elif augment == "shufflemix":
+        embedding_model = ShuffleMix(embedding_model, mixup_layer=mixup_layer)
+        model = ShuffleMixSentenceClassificationModel(embedding_model, n_class)
     elif augment == "adamix":
         embedding_model = AdaMix(embedding_model, mixup_layer=mixup_layer)
         model = AdaMixSentenceClassificationModel(embedding_model, n_class)
