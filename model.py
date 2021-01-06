@@ -253,6 +253,9 @@ class SentenceClassificationModel(nn.Module):
     def load(self):
         self.embedding_model.load()
 
+    def get_embedding_model(self):
+        return self.embedding_model
+
 
 class TMixSentenceClassificationModel(nn.Module):
     def __init__(self, mix_model, n_class):
@@ -267,6 +270,9 @@ class TMixSentenceClassificationModel(nn.Module):
     def load(self):
         self.mix_model.embedding_model.load()
 
+    def get_embedding_model(self):
+        return self.mix_model.embedding_model
+
 
 class ShuffleMixSentenceClassificationModel(nn.Module):
     def __init__(self, mix_model, n_class):
@@ -280,6 +286,9 @@ class ShuffleMixSentenceClassificationModel(nn.Module):
 
     def load(self):
         self.mix_model.embedding_model.load()
+
+    def get_embedding_model(self):
+        return self.mix_model.embedding_model
 
 
 class AdaMixSentenceClassificationModel(nn.Module):
@@ -309,6 +318,9 @@ class AdaMixSentenceClassificationModel(nn.Module):
     def load(self):
         self.mix_model.embedding_model.load()
 
+    def get_embedding_model(self):
+        return self.mix_model.embedding_model
+
 
 def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, n_head=12,
                  k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, augment='none', 
@@ -330,3 +342,9 @@ def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, 
     else:
         raise AttributeError("Invalid augment")
     return model
+
+
+if __name__ == "__main__":
+    m = create_model()
+    for name, _ in m.named_modules():
+        print(name)
