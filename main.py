@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.utils import make_grid
 from transformers import BertModel, BertConfig, BertTokenizerFast
 import matplotlib
 import matplotlib.pyplot as plt
@@ -21,7 +22,7 @@ from tqdm import tqdm
 from data import create_train_and_valid_dataset, CollateFn
 from data import create_test_dataset
 from model import create_model
-from utils import Collector, collect_attention, collect_representation
+from utils import Collector
 
 matplotlib.use('Agg')
 #torch.set_printoptions(profile="full", linewidth=150)
@@ -71,7 +72,35 @@ def calculate_adamix_loss(model, criterion, input_ids, attention_mask,
     return loss, intr_loss
 
 
-def evaluate(model, loader, device):
+def plot_representation(model, loader, writer, device, step):
+    collector = Collector()
+    collector.collect_representation(model.get_embedding_model())
+    collector.collect_attention(model.get_embedding_model())
+    with torch.no_grad():
+        model.eval()
+        correct, count = 0, 0
+        for batch in loader:
+            input_ids = batch["inputs"]["input_ids"].to(device) 
+            attention_mask = batch["inputs"]["attention_mask"].to(device) 
+            labels = batch["labels"].to(device)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            pred = outputs.argmax(dim=1)
+            correct += (labels == pred).float().sum()
+            count += labels.shape[0]
+            for i in range(12):
+                k = "encoder.%d.mhsa_attn" % i
+                t = collector.activations[k]
+                mask = attention_mask.view(-1, 1, 1, attention_mask.shape[1]).expand_as(t).cpu()
+                t = t.view(-1, 1, t.shape[2], t.shape[3])
+                mask = mask.reshape(-1, 1, t.shape[2], t.shape[3])
+                t = torch.cat((t, 1-mask.float(), torch.zeros_like(t)), dim=1)
+                writer.add_image("vis/%s" % k, make_grid(t, nrow=12, pad_value=0.5), step)
+            break
+        model.train()
+    collector.remove_all_hook()
+
+
+def evaluate(model, loader, writer, device):
     with torch.no_grad():
         model.eval()
         correct, count = 0, 0
@@ -82,7 +111,7 @@ def evaluate(model, loader, device):
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             pred = outputs.argmax(dim=1)
             correct += (labels == pred).float().sum()
-            count += labels.shape[0]
+            count += labels.shape[0]    
         acc = correct / count
         model.train()
     return acc.item()
@@ -101,6 +130,8 @@ def train(args, report_func=None):
                               collate_fn=collate_fn)
     valid_loader = DataLoader(valid_dataset, batch_size=256, shuffle=False,
                               collate_fn=collate_fn)
+    plot_loader = DataLoader(valid_dataset, batch_size=4, shuffle=False,
+                             collate_fn=collate_fn)
     
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -110,10 +141,6 @@ def train(args, report_func=None):
                          n_class=train_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
     model.load()     # Load BERT pretrained weight
     model.to(device)
-
-    collector = Collector()
-    collect_representation(model.get_embedding_model(), collector)
-    collect_attention(model.get_embedding_model(), collector)
 
     # Criterion
     criterion = nn.CrossEntropyLoss()
@@ -137,6 +164,9 @@ def train(args, report_func=None):
     # Scheduler
     schedulers = [optim.lr_scheduler.LambdaLR(optimizer, lambda x: min(x/1000, 1))
                   for optimizer in optimizers]
+
+    # Writer
+    writer = SummaryWriter(os.path.join("run", args.exp_id))
 
     step, best_acc, patience = 0, 0, 0
     model.train()
@@ -175,7 +205,6 @@ def train(args, report_func=None):
                 optimizers[0].zero_grad()
                 # Order is important! Update model
                 ((1-args.coeff_intr)*loss).backward()
-            print(collector.activations.keys())
             for optimizer in optimizers:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -183,8 +212,10 @@ def train(args, report_func=None):
                 scheduler.step()
             
             step += 1
+            if step % 10 == 0:
+                plot_representation(model, plot_loader, writer, device, step)
             if step % args.eval_every == 0:
-                acc = evaluate(model, valid_loader, device)
+                acc = evaluate(model, valid_loader, writer, device)
                 if best_acc < acc:
                     best_acc = acc
                     patience = 0
@@ -199,6 +230,8 @@ def train(args, report_func=None):
                     report_func(accuracy=acc, best_accuracy=best_acc)
         if patience == args.patience:
             break
+    writer.close()
+
 
 
 if __name__ == "__main__":
