@@ -55,18 +55,15 @@ def calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels, alp
 
 def calculate_adamix_loss(model, criterion, input_ids, attention_mask,
                           labels, mixup_indices, eps, epoch, step):
-    outs, mix_outs, intr, mix_intr, gamma = model(input_ids=input_ids,
-                                  attention_mask=attention_mask,
-                                  mixup_indices=mixup_indices,
-                                  eps=eps)
+    outs, mix_outs, gamma, intr_loss = model(input_ids=input_ids,
+                                             attention_mask=attention_mask,
+                                             mixup_indices=mixup_indices,
+                                             eps=eps)
     loss1 = criterion(outs, labels).mean()
     loss21 = criterion(mix_outs, labels)
     loss22 = criterion(mix_outs, labels[mixup_indices])
     loss2 = (gamma * loss21 + (1 - gamma) * loss22).mean()
     loss = (loss1 + loss2) / 2
-    intr_loss = F.binary_cross_entropy_with_logits(
-        torch.cat((intr, mix_intr), dim=0),
-        torch.cat((torch.ones_like(intr), torch.zeros_like(mix_intr)), dim=0))
     logging.info("[Epoch %d, Step %d] Loss: %.4f" % (epoch, step, loss))
     logging.info("[Epoch %d, Step %d] Intrusion loss: %.4f" % (epoch, step, intr_loss))
     return loss, intr_loss
@@ -90,17 +87,20 @@ def plot_representation(model, loader, writer, device, step):
             for i in range(12):
                 k = "encoder.%d.mhsa_attn" % i
                 t = collector.activations[k]
+                topk, _ = torch.topk(t, 5, dim=3)
+                topk_mask = t >= topk[:, :, :, [-1]]
                 mask = attention_mask.view(-1, 1, 1, attention_mask.shape[1]).expand_as(t).cpu()
+                topk_mask = topk_mask.view(-1, 1, topk_mask.shape[2], topk_mask.shape[3])
                 t = t.view(-1, 1, t.shape[2], t.shape[3])
                 mask = mask.reshape(-1, 1, t.shape[2], t.shape[3])
-                t = torch.cat((t, 1-mask.float(), torch.zeros_like(t)), dim=1)
+                t = torch.cat((topk_mask.float(), 1-mask.float(), torch.zeros_like(t)), dim=1)
                 writer.add_image("vis/%s" % k, make_grid(t, nrow=12, pad_value=0.5), step)
             break
         model.train()
     collector.remove_all_hook()
 
 
-def evaluate(model, loader, writer, device):
+def evaluate(model, loader, device):
     with torch.no_grad():
         model.eval()
         correct, count = 0, 0
@@ -138,6 +138,7 @@ def train(args, report_func=None):
 
     # Model
     model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
+                         intrusion_layer=args.intrusion_layer,
                          n_class=train_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
     model.load()     # Load BERT pretrained weight
     model.to(device)
@@ -158,7 +159,7 @@ def train(args, report_func=None):
     elif args.augment == "adamix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
                       optim.Adam(model.mix_model.policy_region_generator.parameters(), lr=1e-3),
-                      optim.Adam(model.intrusion_classifier.parameters(), lr=1e-3),
+                      optim.Adam(model.mix_model.intrusion_classifier.parameters(), lr=1e-4),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
 
     # Scheduler
@@ -205,6 +206,10 @@ def train(args, report_func=None):
                 optimizers[0].zero_grad()
                 # Order is important! Update model
                 ((1-args.coeff_intr)*loss).backward()
+                for name, p in model.named_parameters():
+                    if p.requires_grad == True:
+                        value = 0 if p.grad is None else p.grad.data.norm(2)
+                        writer.add_scalar("grad/%s" % name, value, step)
             for optimizer in optimizers:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -212,10 +217,11 @@ def train(args, report_func=None):
                 scheduler.step()
             
             step += 1
-            if step % 10 == 0:
-                plot_representation(model, plot_loader, writer, device, step)
+            if step % 50 == 0:
+                #plot_representation(model, plot_loader, writer, device, step)
+                pass
             if step % args.eval_every == 0:
-                acc = evaluate(model, valid_loader, writer, device)
+                acc = evaluate(model, valid_loader, device)
                 if best_acc < acc:
                     best_acc = acc
                     patience = 0
@@ -247,12 +253,13 @@ if __name__ == "__main__":
     parser.add_argument("--restore", type=str)
     # Train hyperparameter
     parser.add_argument("--epoch", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=96)
+    parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--drop_prob", type=float, default=0.1)
     # Train hyperparameter - augmentation
     parser.add_argument("--augment", type=str, choices=["none", "tmix", "shufflemix", "adamix"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=3)
+    parser.add_argument("--intrusion_layer", type=int, default=6)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--coeff_intr", type=float, default=0.5)
     parser.add_argument("--save_every", type=int, default=500)
@@ -276,6 +283,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
+                         intrusion_layer=args.intrusion_layer,
                          n_class=test_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
     model.to(device)
     model.load_state_dict(torch.load(os.path.join("ckpt", "model_%s.pth" % args.exp_id)))

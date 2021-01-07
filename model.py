@@ -2,6 +2,7 @@ import math
 import logging
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import BertModel
 
 def masked_softmax(vec, mask, dim=1):
@@ -196,40 +197,93 @@ class ProposedMix(nn.Module):
         return h
 
 
-class AdaMix(nn.Module):
-    def __init__(self, embedding_model, mixup_layer=0):
+class PolicyRegionGenerator(nn.Module):
+    def __init__(self, embed_dim):
         super().__init__()
-        self.embedding_model = embedding_model
-        self.policy_region_generator = nn.Sequential(
-            nn.Linear(2*self.embedding_model.embed_dim, 128),
+        self.mhsa = MultiHeadSelfAttention(embed_dim, 12, 64, 64)
+        self.layer = nn.Sequential(
+            nn.Linear(2*embed_dim, 128),
             nn.Tanh(),
             nn.Linear(128, 3),
             nn.Softmax())
+        self.dropout = nn.Dropout(0.1)
+        self.norm = nn.LayerNorm(embed_dim)
+    
+    def forward(self, h, attention_mask, mixup_indices, eps):
+        h = self.norm(h + self.dropout(self.mhsa(h, attention_mask)[0]))
+        sentence_h = masked_mean(h, attention_mask[:, :, None], dim=1)
+        mix_sentence_h = torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1)
+        outputs = self.layer(mix_sentence_h)
+        logging.info("alpha: %.4f, Delta: %.4f" % (outputs[:, 0].mean(), outputs[:, 1].mean()))
+        return outputs[:, 1] * eps + outputs[:, 0]
+
+
+class IntrusionClassifier(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.mhsa = MultiHeadSelfAttention(embed_dim, 12, 64, 64)
+        self.classifier = nn.Sequential(
+            nn.Linear(embed_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1))
+        self.dropout = nn.Dropout(0.1)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, h, attention_mask):
+        h = self.norm(h + self.dropout(self.mhsa(h, attention_mask)[0]))
+        h = masked_mean(h, attention_mask[:, :, None], dim=1)
+        return self.classifier(h)
+
+
+class AdaMix(nn.Module):
+    def __init__(self, embedding_model, mixup_layer=0, intrusion_layer=0):
+        super().__init__()
+        self.embedding_model = embedding_model
+        self.policy_region_generator = PolicyRegionGenerator(embedding_model.embed_dim)
+        self.intrusion_classifier = IntrusionClassifier(embedding_model.embed_dim)
         self.mixup_layer = mixup_layer
+        self.intrusion_layer = intrusion_layer
+        assert mixup_layer <= intrusion_layer
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
         with torch.no_grad():
             h = self.embedding_model.forward_embedding(input_ids)
-        for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
-        if mixup_indices is not None:
-            # Policy Region Generator
-            sentence_h = h.mean(dim=1)
-            policy_region = self.policy_region_generator(
-                torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1))  # [B, 3]
-            gamma = policy_region[:, 1] * eps + policy_region[:, 0]
-            mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
-            mix_h = torch.where(attention_mask[:, :, None] & attention_mask[mixup_indices, :, None],
-                                mix_h, h)
-        for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
+        for layer_idx, module_dict in enumerate(self.embedding_model.encoder):
             if mixup_indices is not None:
-                mix_h = self.embedding_model.forward_layer(mix_h, attention_mask, module_dict)
-
+                if layer_idx == self.mixup_layer:
+                    # Generate Policy Region Generator
+                    gamma = self.policy_region_generator(h, attention_mask, mixup_indices, eps)  # [B]
+                    logging.info("gamma: %.4f" % gamma.mean())
+                    mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
+                    mix_h = torch.where(attention_mask[:, :, None] & attention_mask[mixup_indices, :, None], mix_h, h)
+                    #logging.info("h: %s" % h)
+                    #logging.info("h[mixup]: %s" % h[mixup_indices])
+                    #logging.info("mix_h: %s" % mix_h)
+                if layer_idx == self.intrusion_layer:
+                    # Intrusion Discriminator
+                    pos = self.intrusion_classifier(h, attention_mask)
+                    neg = self.intrusion_classifier(mix_h, attention_mask)
+                    output = torch.cat((pos, neg), dim=0)
+                    label = torch.cat((torch.ones_like(pos), torch.zeros_like(neg)), dim=0)
+                    intr_loss = F.binary_cross_entropy_with_logits(output, label)
+                if layer_idx >= self.mixup_layer:
+                    mix_h = self.embedding_model.forward_layer(mix_h, attention_mask, module_dict)
+            if layer_idx > self.mixup_layer:
+                h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
+            else:
+                with torch.no_grad():
+                    h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
+        if mixup_indices is not None and 12 == self.intrusion_layer:
+            # Intrusion Discriminator
+            pos = self.intrusion_classifier(h, attention_mask)
+            neg = self.intrusion_classifier(mix_h, attention_mask)
+            output = torch.cat((pos, neg), dim=0)
+            label = torch.cat((torch.ones_like(pos), torch.zeros_like(neg)), dim=0)
+            intr_loss = F.binary_cross_entropy_with_logits(output, label)
         if mixup_indices is None:
             return h
         else:
-            return h, mix_h, gamma
+            return h, mix_h, gamma, intr_loss
 
     def predict(self, input_ids, attention_mask):
         return super().forward(input_ids=input_ids, attention_mask=attention_mask)
@@ -296,24 +350,16 @@ class AdaMixSentenceClassificationModel(nn.Module):
         super().__init__()
         self.mix_model = mix_model
         self.classifier = create_sentence_classifier(mix_model.embedding_model.embed_dim, n_class)
-        self.intrusion_classifier = nn.Sequential(
-            nn.Linear(self.mix_model.embedding_model.embed_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 2)
-        )
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
         if mixup_indices is None:
             h = self.mix_model(input_ids, attention_mask)
             return self.classifier(torch.mean(h, dim=1))
         else:
-            h, mix_h, gamma = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
+            h, mix_h, gamma, intr_loss = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
             out = self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
             mix_out = self.classifier(masked_mean(mix_h, attention_mask[:, :, None], dim=1))
-            # Intrusion Discriminator
-            intr = self.intrusion_classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
-            mix_intr = self.intrusion_classifier(masked_mean(mix_h, attention_mask[:, :, None], dim=1))
-            return out, mix_out, intr, mix_intr, gamma
+            return out, mix_out, gamma, intr_loss
         
     def load(self):
         self.mix_model.embedding_model.load()
@@ -324,7 +370,7 @@ class AdaMixSentenceClassificationModel(nn.Module):
 
 def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, n_head=12,
                  k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, augment='none', 
-                 mixup_layer=3, n_class=4):
+                 mixup_layer=3, intrusion_layer=6, n_class=4):
     embedding_model = Bert(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
                            drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
                            feedforward_dim=feedforward_dim, n_layer=n_layer)
@@ -337,7 +383,8 @@ def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, 
         embedding_model = ShuffleMix(embedding_model, mixup_layer=mixup_layer)
         model = ShuffleMixSentenceClassificationModel(embedding_model, n_class)
     elif augment == "adamix":
-        embedding_model = AdaMix(embedding_model, mixup_layer=mixup_layer)
+        embedding_model = AdaMix(embedding_model, mixup_layer=mixup_layer,
+                                 intrusion_layer=intrusion_layer)
         model = AdaMixSentenceClassificationModel(embedding_model, n_class)
     else:
         raise AttributeError("Invalid augment")
