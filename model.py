@@ -268,7 +268,7 @@ class AdaMix(nn.Module):
                     intr_loss = F.binary_cross_entropy_with_logits(output, label)
                 if layer_idx >= self.mixup_layer:
                     mix_h = self.embedding_model.forward_layer(mix_h, attention_mask, module_dict)
-            if layer_idx > self.mixup_layer:
+            if layer_idx >= self.mixup_layer:
                 h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
             else:
                 with torch.no_grad():

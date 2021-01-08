@@ -45,11 +45,11 @@ def calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels, alp
                     attention_mask=attention_mask,
                     mixup_indices=mixup_indices,
                     lambda_=lambda_)
-    loss1 = criterion(outputs, labels)
-    loss2 = criterion(outputs, labels[mixup_indices])
-    loss = lambda_ * loss1 + (1 - lambda_) * loss2
-    logging.info("[Epoch %d, Step %d] Lambda: %.4f, Loss1: %.4f, Loss2: %.4f, Loss: %.4f" % \
-        (epoch, step, lambda_, loss1, loss2, loss))
+    n_class = outputs.shape[1]
+    labels = (labels[:, None] == torch.arange(n_class, device=labels.device).view(1, n_class)).float()
+    labels = lambda_ * labels + (1 - lambda_) * labels[mixup_indices]
+    loss = criterion(F.log_softmax(outputs, dim=1), labels)
+    logging.info("[Epoch %d, Step %d] Lambda: %.4f, Loss: %.4f" % (epoch, step, lambda_, loss))
     return loss
 
 
@@ -144,7 +144,12 @@ def train(args, report_func=None):
     model.to(device)
 
     # Criterion
-    criterion = nn.CrossEntropyLoss()
+    if args.augment == "none":
+        criterion = nn.CrossEntropyLoss()
+    elif args.augment == "tmix":
+        criterion = nn.KLDivLoss(reduction="batchmean")
+    else:
+        criterion = nn.CrossEntropyLoss()
 
     # Optimizer
     if args.augment == "none":
@@ -259,12 +264,12 @@ if __name__ == "__main__":
     # Train hyperparameter - augmentation
     parser.add_argument("--augment", type=str, choices=["none", "tmix", "shufflemix", "adamix"], default="none")
     parser.add_argument("--mixup_layer", type=int, default=3)
-    parser.add_argument("--intrusion_layer", type=int, default=6)
+    parser.add_argument("--intrusion_layer", type=int, default=12)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--coeff_intr", type=float, default=0.5)
-    parser.add_argument("--save_every", type=int, default=500)
-    parser.add_argument("--eval_every", type=int, default=500)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--save_every", type=int, default=100)
+    parser.add_argument("--eval_every", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=20)
     args = parser.parse_args()
     args.exp_id = str(uuid.uuid4())[:8]
 
