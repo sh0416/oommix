@@ -47,7 +47,7 @@ def preprocess(load_f, filepath, tokenizer):
     cached_filepath = os.path.join("/data/sh0416/cache", 'cache_'+filepath)
     if not os.path.exists(cached_filepath):
         data = load_f(filepath)
-        for row in tqdm(data, desc="Tokenize amazon text"):
+        for row in tqdm(data, desc="Tokenization"):
             row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=256, truncation=True)["input_ids"]))
         os.makedirs(os.path.dirname(cached_filepath), exist_ok=True)
         save_csv(cached_filepath, data, ["input", "label"])
@@ -65,9 +65,9 @@ def load_yahoo_answer(filepath):
             for row in tqdm(load_csv(filepath, ["class", "title", "content", "answer"]), desc="Load yahoo dataset")]
 
 
-def load_amazon_review_full(filepath):
+def load_amazon_review_polarity(filepath):
     return [{"label": int(row["class"]) - 1, "input": row["text"]}
-            for row in tqdm(load_csv(filepath, ["class", "title", "text"]), desc="Load amazon dataset")]
+            for row in tqdm(load_csv(filepath, ["class", "title", "text"]), desc="Load amazon review polarity dataset")]
 
 
 def load_yelp_polarity(filepath):
@@ -85,9 +85,10 @@ def create_metadata(dataset):
         data_load_func = load_yahoo_answer
         n_class = 10
         num_valid_data = 5000 * n_class
-    elif dataset == "amazon_review_full":
-        data_load_func = load_amazon_review_full
-        n_class = 5
+    elif dataset == "amazon_review_polarity":
+        data_load_func = load_amazon_review_polarity
+        n_class = 2
+        num_valid_data = 4000 * n_class
     elif dataset == "yelp_polarity":
         data_load_func = load_yelp_polarity
         n_class = 2

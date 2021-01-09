@@ -254,7 +254,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     # Data hyperparameter
     parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--dataset", type=str, choices=["ag_news", "yahoo_answer"], default="ag_news")
+    parser.add_argument("--dataset", type=str, choices=["ag_news", "yahoo_answer", "amazon_review_polarity"], default="ag_news")
     parser.add_argument("--num_train_data", type=int, default=-1, help="Number of train dataset. Use first `num_train` row. -1 means whole dataset")
     parser.add_argument("--max_length", type=int, default=256)
     # Model hyperparameter
