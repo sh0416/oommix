@@ -301,7 +301,6 @@ class SentenceClassificationModel(nn.Module):
 
     def forward(self, input_ids, attention_mask):
         h = self.embedding_model(input_ids, attention_mask)
-        self.h = h
         return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
 
     def load(self):
