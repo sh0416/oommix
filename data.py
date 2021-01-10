@@ -3,6 +3,7 @@ import csv
 import logging
 from collections import Counter
 import numpy as np
+import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
@@ -121,7 +122,24 @@ def augment_data(data, split_num, reflection):
     return data + augmented_data
 
 
-def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-1):
+def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-1, return_type="pytorch"):
+    """Create dataset for training script or analyzing data.
+
+    :param dataset: The name of dataset
+    :type dataset: str
+    :param dirpath: The directory path for actual raw data
+    :type dirpath: str
+    :param tokenizer: The tokenizer to tokenize real text into sequence of tokens
+    :type tokenizer: huggingface transformer package Tokenizer class
+    :param num_train_data: The number of available training data instances, defaults to -1 means the whole data
+    :type num_train_data: int, optional
+    :param return_type: The returned type, if "pytorch" means the data is represented as Dataset,
+                         if "pandas" means the data is represented as DataFrame, defaults to "pytorch"
+    :type return_type: str, optional
+    :return: [description]
+    :rtype: [type]
+    """
+
     data_load_func, n_class, num_valid_data = create_metadata(dataset)
     train_data = preprocess(data_load_func, os.path.join(dirpath, "train.csv"), tokenizer)
     # Stratified split
@@ -141,8 +159,12 @@ def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-
     logging.info("Valid observed token number: %d" % len(valid_token))
     logging.info("Out of vocabulary token number: %d" % len(oov_token))
     logging.info("Ouf of vocabulary rate: %.4f" % (len(oov_token) / len(valid_token)))
-    train_dataset = ListDataset(train_data, n_class)
-    valid_dataset = ListDataset(valid_data, n_class)
+    if return_type == "pytorch":
+        train_dataset = ListDataset(train_data, n_class)
+        valid_dataset = ListDataset(valid_data, n_class)
+    elif return_type == "pandas":
+        train_dataset = pd.DataFrame(data=train_data)
+        valid_dataset = pd.DataFrame(data=valid_data)
     return train_dataset, valid_dataset
     
 
