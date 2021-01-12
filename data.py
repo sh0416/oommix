@@ -45,23 +45,6 @@ def save_csv(filepath, data, fieldnames):
         writer.writerows(data)
 
 
-def get_cached_filepath(filepath):
-    return os.path.join('cache', filepath)
-
-
-def preprocess(load_f, filepath, tokenizer):
-    cached_filepath = os.path.join("/data/sh0416/cache", 'cache_'+filepath)
-    if not os.path.exists(cached_filepath):
-        data = load_f(filepath)
-        for row in tqdm(data, desc="Tokenization"):
-            assert row["label"] is not None
-            row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=256, truncation=True)["input_ids"]))
-        os.makedirs(os.path.dirname(cached_filepath), exist_ok=True)
-        save_csv(cached_filepath, data, ["input", "label"])
-    return [{"input": list(map(int, row["input"].split(' '))), "label": int(row["label"])}
-            for row in load_csv(cached_filepath)]
-
-
 def load_ag_news(filepath):
     return [{"label": int(row["class"]) - 1, "input": row["description"]}
             for row in tqdm(load_csv(filepath, ["class", "title", "description"]), desc="Load ag news dataset")]
@@ -182,7 +165,77 @@ def backtranslate(target_dir, dataset, dirpath, num_train):
     train_df.to_csv(os.path.join(target_dir, "train.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
 
 
-def create_train_and_valid_dataset(dataset, dirpath, tokenizer=None, num_train_data=-1, return_type="pytorch"):
+CACHE_DIR = "/data/sh0416/cache"
+
+def split_train_validation(load_f, src_path: str, tgt_train_path: str, tgt_valid_path: str, num_train_data: int, num_valid_data: int) -> None:
+    if not os.path.exists(tgt_train_path) or not os.path.exists(tgt_valid_path):
+        train_data = load_f(src_path)
+        train_data, valid_data = train_test_split(train_data, test_size=num_valid_data, random_state=42,
+                                                  shuffle=True, stratify=[x["label"] for x in train_data])
+        # Sample training data
+        if num_train_data != -1:
+            _, train_data = train_test_split(train_data, test_size=num_train_data, random_state=42,
+                                            shuffle=True, stratify=[x["label"] for x in train_data])
+        # For valid data, sort by length to accelerate inference
+        valid_data = sorted(valid_data, key=lambda x: len(x["input"]), reverse=True)
+        save_csv(tgt_train_path, train_data, ["input", "label"])
+        save_csv(tgt_valid_path, valid_data, ["input", "label"])
+    
+
+def apply_eda(train_data):
+    train_df = pd.DataFrame(data=train_data)
+    train_df.to_csv("eda_input.tsv", columns=["label", "input"], sep='\t',
+                    index=False, header=False)
+    subprocess.run(["python", "eda_nlp/code/augment.py", "--num_aug", "5",
+                    "--input", "eda_input.tsv", "--output", "eda_output.tsv"])
+    train_df = pd.read_csv("eda_output.tsv", names=["label", "input"], sep='\t')
+    train_data = [{"input": row["input"], "label": row["label"]}
+                  for _, row in train_df.iterrows()]
+    os.remove("eda_input.tsv")
+    os.remove("eda_output.tsv")
+    return train_data
+
+
+def apply_backtranslate(train_data):
+    raise NotImplementedError
+
+
+def apply_ssmba(train_data):
+    raise NotImplementedError
+
+
+def apply_augmentation(src_path: str, tgt_path: str, augmentation: str) -> None:
+    if not os.path.exists(tgt_path):
+        if augmentation != "none":
+            data = load_csv(src_path)
+            if augmentation == "eda":
+                data = apply_eda(data)
+            elif augmentation == "backtranslate":
+                data = apply_backtranslate(data)
+            elif augmentation == "ssmba":
+                data = apply_ssmba(data)
+            else:
+                raise AttributeError()
+            # Overwrite existing training data to augmented one
+            save_csv(tgt_path, data, ["input", "label"])
+    else:
+        data = load_csv(tgt_path)
+    return data
+
+
+def tokenize(src_path, tgt_path, tokenizer):
+    if not os.path.exists(tgt_path):
+        data = list(load_csv(src_path))
+        for row in tqdm(data, desc="Tokenization"):
+            row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=256, truncation=True)["input_ids"]))
+        save_csv(tgt_path, data, ["input", "label"])
+    else:
+        data = load_csv(tgt_path)
+    return [{"input": list(map(int, row["input"].split(' '))), "label": int(row["label"])}
+            for row in data]
+
+
+def create_train_and_valid_dataset(dataset, dirpath, augmentation=None, tokenizer=None, num_train_data=-1, return_type="pytorch"):
     """Create dataset for training script or analyzing data.
 
     :param dataset: The name of dataset
@@ -199,21 +252,28 @@ def create_train_and_valid_dataset(dataset, dirpath, tokenizer=None, num_train_d
     :return: [description]
     :rtype: [type]
     """
-
     data_load_func, n_class, num_valid_data = create_metadata(dataset)
-    if tokenizer is None:
-        train_data = data_load_func(os.path.join(dirpath, "train.csv"))
-    else:
-        train_data = preprocess(data_load_func, os.path.join(dirpath, "train.csv"), tokenizer)
-    # Stratified split
-    train_data, valid_data = train_test_split(train_data, test_size=num_valid_data, random_state=42,
-                                              shuffle=True, stratify=[x["label"] for x in train_data])
-    # For only valid data, sort by length to accelerate inference
-    valid_data = sorted(valid_data, key=lambda x: len(x["input"]), reverse=True)
-    if num_train_data != -1:
-        _, train_data = train_test_split(train_data, test_size=num_train_data, random_state=42,
-                                         shuffle=True, stratify=[x["label"] for x in train_data])
-
+    cache_path = "%s_%d_%s" % (dataset, num_train_data, augmentation)
+    # 0. Make cache directory
+    os.makedirs(os.path.join(CACHE_DIR, cache_path), exist_ok=True)
+    # 1. Train Validation split
+    split_train_validation(data_load_func,
+                           os.path.join(dirpath, "train.csv"),
+                           os.path.join(CACHE_DIR, cache_path, "train.csv"),
+                           os.path.join(CACHE_DIR, cache_path, "valid.csv"),
+                           num_train_data,
+                           num_valid_data)
+    # 2. Apply augmentation if specified
+    apply_augmentation(os.path.join(CACHE_DIR, cache_path, "train.csv"),
+                       os.path.join(CACHE_DIR, cache_path, "train_augmented.csv"),
+                       augmentation)
+    # 3. Tokenize given data
+    train_data = tokenize(os.path.join(CACHE_DIR, cache_path, "train_augmented.csv"),
+                          os.path.join(CACHE_DIR, cache_path, "train_augmented_tokenized.csv"),
+                          tokenizer)
+    valid_data = tokenize(os.path.join(CACHE_DIR, cache_path, "valid.csv"),
+                          os.path.join(CACHE_DIR, cache_path, "valid_tokenized.csv"),
+                          tokenizer)
     # Calculate the observed token number
     train_token = set(token for row in train_data for token in row["input"])
     valid_token = set(token for row in valid_data for token in row["input"])
@@ -231,73 +291,12 @@ def create_train_and_valid_dataset(dataset, dirpath, tokenizer=None, num_train_d
     return train_dataset, valid_dataset
     
 
-def create_eda_train_and_valid_dataset(dataset, dirpath, tokenizer=None, num_train_data=-1, return_type="pytorch"):
-    """Create dataset for training script or analyzing data.
-
-    :param dataset: The name of dataset
-    :type dataset: str
-    :param dirpath: The directory path for actual raw data
-    :type dirpath: str
-    :param tokenizer: The tokenizer to tokenize real text into sequence of tokens
-    :type tokenizer: huggingface transformer package Tokenizer class
-    :param num_train_data: The number of available training data instances, defaults to -1 means the whole data
-    :type num_train_data: int, optional
-    :param return_type: The returned type, if "pytorch" means the data is represented as Dataset,
-                         if "pandas" means the data is represented as DataFrame, defaults to "pytorch"
-    :type return_type: str, optional
-    :return: [description]
-    :rtype: [type]
-    """
-    data_load_func, n_class, num_valid_data = create_metadata(dataset)
-    if tokenizer is None:
-        train_data = load_eda(os.path.join(dirpath, "train.csv"))
-        valid_data = load_eda(os.path.join(dirpath, "valid.csv"))
-    else:
-        train_data = preprocess(load_eda, os.path.join(dirpath, "train.csv"), tokenizer)
-        valid_data = preprocess(load_eda, os.path.join(dirpath, "valid.csv"), tokenizer)
-    # For only valid data, sort by length to accelerate inference
-    valid_data = sorted(valid_data, key=lambda x: len(x["input"]), reverse=True)
-    if num_train_data != -1:
-        _, train_data = train_test_split(train_data, test_size=num_train_data, random_state=42,
-                                         shuffle=True, stratify=[x["label"] for x in train_data])
-
-    # Calculate the observed token number
-    train_token = set(token for row in train_data for token in row["input"])
-    valid_token = set(token for row in valid_data for token in row["input"])
-    oov_token = valid_token - train_token
-    logging.info("Train observed token number: %d" % len(train_token))
-    logging.info("Valid observed token number: %d" % len(valid_token))
-    logging.info("Out of vocabulary token number: %d" % len(oov_token))
-    logging.info("Ouf of vocabulary rate: %.4f" % (len(oov_token) / len(valid_token)))
-    if return_type == "pytorch":
-        train_dataset = ListDataset(train_data, n_class)
-        valid_dataset = ListDataset(valid_data, n_class)
-    elif return_type == "pandas":
-        train_dataset = pd.DataFrame(data=train_data)
-        valid_dataset = pd.DataFrame(data=valid_data)
-    return train_dataset, valid_dataset
-
-
 def create_test_dataset(dataset, dirpath, tokenizer=None, return_type="pytorch"):
     data_load_func, n_class, _ = create_metadata(dataset)
     if tokenizer is None:
         test_data = data_load_func(os.path.join(dirpath, "test.csv"))
     else:
         test_data = preprocess(data_load_func, os.path.join(dirpath, "test.csv"), tokenizer)
-    test_data = sorted(test_data, key=lambda x: len(x["input"]), reverse=True)
-    if return_type == "pytorch":
-        test_dataset = ListDataset(test_data, n_class)
-    elif return_type == "pandas":
-        test_dataset = pd.DataFrame(data=test_data)
-    return test_dataset
-
-
-def create_eda_test_dataset(dataset, dirpath, tokenizer=None, return_type="pytorch"):
-    data_load_func, n_class, _ = create_metadata(dataset)
-    if tokenizer is None:
-        test_data = load_eda(os.path.join(dirpath, "test.csv"))
-    else:
-        test_data = preprocess(load_eda, os.path.join(dirpath, "test.csv"), tokenizer)
     test_data = sorted(test_data, key=lambda x: len(x["input"]), reverse=True)
     if return_type == "pytorch":
         test_dataset = ListDataset(test_data, n_class)
@@ -335,22 +334,6 @@ class CollateFn:
             """
             labels = torch.stack([x["label"] for x in batch])
         return {"idx": idx, "inputs": inputs, "labels": labels}
-
-
-def eda(eda_data_dir, dataset, dirpath, num_train):
-    dirname = os.path.basename(dirpath)
-    eda_dirpath = os.path.join(eda_data_dir, "%s_%d" % (dirname, num_train))
-    os.makedirs(eda_dirpath, exist_ok=True)
-
-    train_df, valid_df = create_train_and_valid_dataset(dataset, dirpath, None, num_train, "pandas")
-    test_df = create_test_dataset(dataset, dirpath, None, "pandas")
-    train_df.to_csv(os.path.join(eda_dirpath, "train.tsv"), columns=["label", "input"], sep='\t', index=False, header=False)
-
-    subprocess.run(["/home/sh0416/anaconda3/envs/python3.8/bin/python", "eda_nlp/code/augment.py", "--input", os.path.join(eda_dirpath, "train.tsv"), "--num_aug", "5"])
-    train_df = pd.read_csv(os.path.join(eda_dirpath, "eda_train.tsv"), names=["label", "input"], sep='\t')
-    train_df.to_csv(os.path.join(eda_dirpath, "train.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
-    valid_df.to_csv(os.path.join(eda_dirpath, "valid.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
-    test_df.to_csv(os.path.join(eda_dirpath, "test.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
 
 
 if __name__ == "__main__":

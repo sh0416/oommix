@@ -18,11 +18,8 @@ import matplotlib
 import matplotlib.pyplot as plt
 from torchviz import make_dot
 from tqdm import tqdm
-
 from data import create_train_and_valid_dataset, CollateFn
-from data import create_eda_train_and_valid_dataset
 from data import create_test_dataset
-from data import create_eda_test_dataset
 from model import create_model
 from utils import Collector
 
@@ -125,14 +122,9 @@ def evaluate(model, loader, device):
 def train(args, report_func=None):
     # Dataset
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-    if args.eda:
-        train_dataset, valid_dataset = create_eda_train_and_valid_dataset(
-            dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer,
-            num_train_data=args.num_train_data)
-    else:
-        train_dataset, valid_dataset = create_train_and_valid_dataset(
-            dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer,
-            num_train_data=args.num_train_data)
+    train_dataset, valid_dataset = create_train_and_valid_dataset(
+        dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer,
+        num_train_data=args.num_train_data, augmentation=args.data_augment)
 
     # Loader
     collate_fn = CollateFn(tokenizer, args.max_length)
@@ -264,8 +256,12 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     # Data hyperparameter
     parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--dataset", type=str, choices=["ag_news", "yahoo_answer", "amazon_review_polarity", "dbpedia"], default="ag_news")
-    parser.add_argument("--num_train_data", type=int, default=-1, help="Number of train dataset. Use first `num_train` row. -1 means whole dataset")
+    parser.add_argument("--dataset", type=str, default="ag_news",
+                        choices=["ag_news", "yahoo_answer", "amazon_review_polarity", "dbpedia"])
+    parser.add_argument("--num_train_data", type=int, default=-1,
+                        help="Number of train dataset. Use first `num_train` row. -1 means whole dataset")
+    parser.add_argument("--data_augment", type=str, default="none", 
+                        choices=["none", "eda", "backtranslate", "ssmba"])
     parser.add_argument("--max_length", type=int, default=256)
     # Model hyperparameter
     parser.add_argument("--restore", type=str)
@@ -284,7 +280,6 @@ if __name__ == "__main__":
     parser.add_argument("--eval_every", type=int, default=100)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--eda", action="store_true")
     args = parser.parse_args()
     args.exp_id = str(uuid.uuid4())[:8]
 
@@ -294,14 +289,9 @@ if __name__ == "__main__":
     train(args)
 
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-    if args.eda:
-        test_dataset = create_eda_test_dataset(dataset=args.dataset,
-                                           dirpath=args.data_dir,
-                                           tokenizer=tokenizer)
-    else:
-        test_dataset = create_test_dataset(dataset=args.dataset,
-                                           dirpath=args.data_dir,
-                                           tokenizer=tokenizer)
+    test_dataset = create_test_dataset(dataset=args.dataset,
+                                       dirpath=args.data_dir,
+                                       tokenizer=tokenizer)
     collate_fn = CollateFn(tokenizer, args.max_length)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False,
                              collate_fn=collate_fn)
