@@ -66,11 +66,6 @@ def load_dbpedia(filepath):
     return data
 
 
-def load_eda(filepath):
-    return [{"label": int(row["label"]), "input": row["input"]}
-            for row in tqdm(load_csv(filepath, ["label", "input"]), desc="Load eda augmented data")]
-
-
 def create_metadata(dataset):
     if dataset == "ag_news":
         data_load_func = load_ag_news
@@ -91,78 +86,6 @@ def create_metadata(dataset):
     else:
         raise AttributeError("Invalid dataset")
     return data_load_func, n_class, num_valid_data
-
-
-def augment_data(data, split_num, reflection):
-    pair_frequency = Counter()
-    for row in data:
-        pair_frequency.update(zip(row['input'], row['input'][1:]))
-    pair_priority = {pair: i for i, (pair, count) in enumerate(pair_frequency.most_common())}
-    augmented_data = []
-    for row in tqdm(data):
-        pairs = list(zip(row['input'], row['input'][1:]))
-        priorities = list(map(lambda x: pair_priority[x], pairs))
-        rank = np.asarray(priorities).argsort()[::-1].argsort()
-        sublist, sid = [], 0
-        for eid, rank in enumerate(rank, start=1):
-            if rank < split_num:
-                sublist.append(row['input'][sid:eid])
-                sid = eid
-        for _ in range(reflection):
-            np.random.shuffle(sublist)
-            augmented_data.append(
-                {'input': [t for l in sublist for t in l],
-                 'label': row['label']}
-            )
-    return data + augmented_data
-
-
-def backtranslate(target_dir, dataset, dirpath, num_train):
-    dirname = os.path.basename(dirpath)
-    target_dir = os.path.join(target_dir, "%s_%d" % (dirname, num_train))
-    os.makedirs(target_dir, exist_ok=True)
-
-    train_df, valid_df = create_train_and_valid_dataset(dataset, dirpath, None, num_train, "pandas")
-    test_df = create_test_dataset(dataset, dirpath, None, "pandas")
-    valid_df.to_csv(os.path.join(target_dir, "valid.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
-    test_df.to_csv(os.path.join(target_dir, "test.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
-
-    # Pretrained translation model
-    en2ru = torch.hub.load('pytorch/fairseq', 'transformer.wmt19.en-ru.single_model', tokenizer='moses', bpe='fastbpe').cuda()
-    ru2en = torch.hub.load('pytorch/fairseq', 'transformer.wmt19.ru-en.single_model', tokenizer='moses', bpe='fastbpe').cuda()
-
-    def f(sentences):
-        sentences = [s[:1024] if len(s) > 1024 else s for s in sentences]
-        x = en2ru.translate(sentences, sampling=True, temperature=0.9)
-        x = [s[:1024] if len(s) > 1024 else s for s in x]
-        return ru2en.translate(x, sampling=True, temperature=0.9)
-
-    # Split sentence because translation model doesn't handle long text
-    augmented_inputs = defaultdict(list)
-    sentences = [(idx, s) for idx, row in train_df.iterrows() for s in sent_tokenize(row["input"])]
-
-    with torch.no_grad():
-        for batch_idx in tqdm(range(0, len(sentences), 128)):
-            batch = sentences[batch_idx:min(batch_idx+128, len(sentences))]
-            for i in range(5):
-                augmented_sentences = f([x[1] for x in batch])
-            
-                reconstructed_input = defaultdict(list)
-                for (idx, _), s in zip(sentences, augmented_sentences):
-                    reconstructed_input[idx].append(s)
-                
-                for k, v in reconstructed_input.items():
-                    augmented_inputs[k].append(' '.join(v))
-
-    train_df["augmented_inputs"] = train_df.index.map(augmented_inputs)
-    train_data = []
-    for idx, row in train_df.iterrows():
-        train_data.append({"label": row["label"], "input": row["input"]})
-        train_data.extend([{"label": row["label"], "input": x} for x in row["augmented_inputs"]])
-
-    train_df = pd.DataFrame(data=train_data)
-    # Save train data
-    train_df.to_csv(os.path.join(target_dir, "train.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
 
 
 CACHE_DIR = "/data/sh0416/cache"
@@ -196,8 +119,39 @@ def apply_eda(train_data):
     return train_data
 
 
-def apply_backtranslate(train_data):
-    raise NotImplementedError
+def apply_backtranslate(data):
+    # Pretrained translation model
+    en2ru = torch.hub.load('pytorch/fairseq', 'transformer.wmt19.en-ru.single_model',
+                           tokenizer='moses', bpe='fastbpe').cuda()
+    ru2en = torch.hub.load('pytorch/fairseq', 'transformer.wmt19.ru-en.single_model',
+                           tokenizer='moses', bpe='fastbpe').cuda()
+
+    result = list(data)
+    sentences = [(idx, idx2, s)
+                 for idx, row in enumerate(data)
+                 for idx2, s in enumerate(sent_tokenize(row["input"]))]
+    sentences = sorted(sentences, key=lambda x: len(x[2]), reverse=True)
+    with torch.no_grad():
+        for _ in range(1):
+            augmented_sentences = []
+            for idx in tqdm(range(0, len(sentences), 32), desc="backtranslate"):
+                batch = sentences[idx:min(idx+32, len(sentences))]
+                inputs = [s[2][:1024] if len(s[2])>1024 else s[2] for s in batch]
+                middle = en2ru.translate(inputs, beam=5)
+                middle = [s[:1024] if len(s)>1024 else s for s in middle]
+                new_inputs = ru2en.translate(middle, sampling=True)
+                augmented_sentences.extend(new_inputs)
+            augmented_sentences = [(idx, idx2, s)
+                                   for (idx, idx2, _), s in zip(sentences, augmented_sentences)]
+            augmented_sentences = sorted(augmented_sentences)
+            augmented_data = defaultdict(dict)
+            for idx, idx2, s in augmented_sentences:
+                augmented_data[idx][idx2] = s
+            augmented_data = {k: ' '.join([s for _, s in sorted(v.items())])
+                              for k, v in augmented_data.items()}
+            result.extend([{"input": v, "label": data[k]["label"]}
+                            for k, v in augmented_data.items()])
+    return result
 
 
 def apply_ssmba(train_data):
@@ -207,7 +161,7 @@ def apply_ssmba(train_data):
 def apply_augmentation(src_path: str, tgt_path: str, augmentation: str) -> None:
     if not os.path.exists(tgt_path):
         if augmentation != "none":
-            data = load_csv(src_path)
+            data = list(load_csv(src_path))
             if augmentation == "eda":
                 data = apply_eda(data)
             elif augmentation == "backtranslate":
@@ -219,7 +173,7 @@ def apply_augmentation(src_path: str, tgt_path: str, augmentation: str) -> None:
             # Overwrite existing training data to augmented one
             save_csv(tgt_path, data, ["input", "label"])
     else:
-        data = load_csv(tgt_path)
+        data = list(load_csv(tgt_path))
     return data
 
 
@@ -334,31 +288,3 @@ class CollateFn:
             """
             labels = torch.stack([x["label"] for x in batch])
         return {"idx": idx, "inputs": inputs, "labels": labels}
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
-    data_dir = "/data/sh0416/dataset/pdistmix"
-    """
-    eda_data_dir = os.path.join(data_dir, "eda")
-    os.makedirs(eda_data_dir, exist_ok=True)
-    eda(eda_data_dir, "ag_news", os.path.join(data_dir, "ag_news_csv"), 2500)
-    eda(eda_data_dir, "ag_news", os.path.join(data_dir, "ag_news_csv"), 10000)
-    eda(eda_data_dir, "yahoo_answer", os.path.join(data_dir, "yahoo_answers_csv"), 2000)
-    eda(eda_data_dir, "yahoo_answer", os.path.join(data_dir, "yahoo_answers_csv"), 25000)
-    eda(eda_data_dir, "amazon_review_polarity", os.path.join(data_dir, "amazon_review_polarity_csv"), 2500)
-    eda(eda_data_dir, "amazon_review_polarity", os.path.join(data_dir, "amazon_review_polarity_csv"), 10000)
-    eda(eda_data_dir, "dbpedia", os.path.join(data_dir, "dbpedia_csv"), 2800)
-    eda(eda_data_dir, "dbpedia", os.path.join(data_dir, "dbpedia_csv"), 35000)
-    """
-
-    backtranslate_dir = os.path.join(data_dir, "backtranslate")
-    os.makedirs(backtranslate_dir, exist_ok=True)
-    #backtranslate(backtranslate_dir, "ag_news", os.path.join(data_dir, "ag_news_csv"), 2500)
-    #backtranslate(backtranslate_dir, "ag_news", os.path.join(data_dir, "ag_news_csv"), 10000)
-    #backtranslate(backtranslate_dir, "yahoo_answer", os.path.join(data_dir, "yahoo_answers_csv"), 2000)
-    #backtranslate(backtranslate_dir, "yahoo_answer", os.path.join(data_dir, "yahoo_answers_csv"), 25000)
-    #backtranslate(backtranslate_dir, "amazon_review_polarity", os.path.join(data_dir, "amazon_review_polarity_csv"), 2500)
-    backtranslate(backtranslate_dir, "amazon_review_polarity", os.path.join(data_dir, "amazon_review_polarity_csv"), 10000)
-    #backtranslate(backtranslate_dir, "dbpedia", os.path.join(data_dir, "dbpedia_csv"), 2800)
-    #backtranslate(backtranslate_dir, "dbpedia", os.path.join(data_dir, "dbpedia_csv"), 35000)
