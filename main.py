@@ -20,7 +20,9 @@ from torchviz import make_dot
 from tqdm import tqdm
 
 from data import create_train_and_valid_dataset, CollateFn
+from data import create_eda_train_and_valid_dataset
 from data import create_test_dataset
+from data import create_eda_test_dataset
 from model import create_model
 from utils import Collector
 
@@ -123,9 +125,14 @@ def evaluate(model, loader, device):
 def train(args, report_func=None):
     # Dataset
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-    train_dataset, valid_dataset = create_train_and_valid_dataset(
-        dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer,
-        num_train_data=args.num_train_data)
+    if args.eda:
+        train_dataset, valid_dataset = create_eda_train_and_valid_dataset(
+            dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer,
+            num_train_data=args.num_train_data)
+    else:
+        train_dataset, valid_dataset = create_train_and_valid_dataset(
+            dataset=args.dataset, dirpath=args.data_dir, tokenizer=tokenizer,
+            num_train_data=args.num_train_data)
 
     # Loader
     collate_fn = CollateFn(tokenizer, args.max_length)
@@ -137,7 +144,10 @@ def train(args, report_func=None):
                              collate_fn=collate_fn)
     
     # Device
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(torch.cuda.current_device())
 
     # Model
     model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
@@ -237,9 +247,9 @@ def train(args, report_func=None):
                     torch.save(model.state_dict(), os.path.join("ckpt", "./model_%s.pth" % args.exp_id))
                 else:
                     patience += 1
-                    if patience == args.patience:
-                        break
                 logging.info("Accuracy: %.4f, Best accuracy: %.4f" % (acc, best_acc))
+                if patience == args.patience:
+                    break
                 if report_func is not None:
                     report_func(accuracy=acc, best_accuracy=best_acc)
         if patience == args.patience:
@@ -254,7 +264,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     # Data hyperparameter
     parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--dataset", type=str, choices=["ag_news", "yahoo_answer", "amazon_review_polarity"], default="ag_news")
+    parser.add_argument("--dataset", type=str, choices=["ag_news", "yahoo_answer", "amazon_review_polarity", "dbpedia"], default="ag_news")
     parser.add_argument("--num_train_data", type=int, default=-1, help="Number of train dataset. Use first `num_train` row. -1 means whole dataset")
     parser.add_argument("--max_length", type=int, default=256)
     # Model hyperparameter
@@ -273,6 +283,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--eval_every", type=int, default=100)
     parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--eda", action="store_true")
     args = parser.parse_args()
     args.exp_id = str(uuid.uuid4())[:8]
 
@@ -282,14 +294,22 @@ if __name__ == "__main__":
     train(args)
 
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-    test_dataset = create_test_dataset(dataset=args.dataset,
-                                       dirpath=args.data_dir,
-                                       tokenizer=tokenizer)
+    if args.eda:
+        test_dataset = create_eda_test_dataset(dataset=args.dataset,
+                                           dirpath=args.data_dir,
+                                           tokenizer=tokenizer)
+    else:
+        test_dataset = create_test_dataset(dataset=args.dataset,
+                                           dirpath=args.data_dir,
+                                           tokenizer=tokenizer)
     collate_fn = CollateFn(tokenizer, args.max_length)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False,
                              collate_fn=collate_fn)
 
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(torch.cuda.current_device())
     model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
                          intrusion_layer=args.intrusion_layer,
                          n_class=test_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
@@ -297,6 +317,8 @@ if __name__ == "__main__":
     model.load_state_dict(torch.load(os.path.join("ckpt", "model_%s.pth" % args.exp_id)))
 
     test_acc = evaluate(model, test_loader, device)
+    for k, v in vars(args).items():
+        logging.info("Parameter %s = %s" % (k, str(v)))
     logging.info("Test accuracy: %.4f" % test_acc)
 
     os.makedirs("param", exist_ok=True)

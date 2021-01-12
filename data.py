@@ -1,7 +1,11 @@
 import os
+import sys
 import csv
 import logging
-from collections import Counter
+import subprocess
+from collections import Counter, defaultdict
+import nltk
+from nltk.tokenize import sent_tokenize
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -10,6 +14,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+nltk.download('punkt')
 
 class ListDataset(Dataset):
     def __init__(self, data, n_class):
@@ -49,6 +54,7 @@ def preprocess(load_f, filepath, tokenizer):
     if not os.path.exists(cached_filepath):
         data = load_f(filepath)
         for row in tqdm(data, desc="Tokenization"):
+            assert row["label"] is not None
             row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=256, truncation=True)["input_ids"]))
         os.makedirs(os.path.dirname(cached_filepath), exist_ok=True)
         save_csv(cached_filepath, data, ["input", "label"])
@@ -71,10 +77,15 @@ def load_amazon_review_polarity(filepath):
             for row in tqdm(load_csv(filepath, ["class", "title", "text"]), desc="Load amazon review polarity dataset")]
 
 
-def load_yelp_polarity(filepath):
-    data = [{"label": int(row["class"]) - 1, "input": row["review"]}
-            for row in tqdm(load_csv(filepath, ["class", "review"]), desc="Load yelp polarity")]
+def load_dbpedia(filepath):
+    data = [{"label": int(row["class"]) - 1, "input": row["content"]}
+            for row in tqdm(load_csv(filepath, ["class", "title", "content"]), desc="Load dbpedia")]
     return data
+
+
+def load_eda(filepath):
+    return [{"label": int(row["label"]), "input": row["input"]}
+            for row in tqdm(load_csv(filepath, ["label", "input"]), desc="Load eda augmented data")]
 
 
 def create_metadata(dataset):
@@ -90,9 +101,10 @@ def create_metadata(dataset):
         data_load_func = load_amazon_review_polarity
         n_class = 2
         num_valid_data = 4000 * n_class
-    elif dataset == "yelp_polarity":
-        data_load_func = load_yelp_polarity
-        n_class = 2
+    elif dataset == "dbpedia":
+        data_load_func = load_dbpedia
+        n_class = 14
+        num_valid_data = 2000 * n_class
     else:
         raise AttributeError("Invalid dataset")
     return data_load_func, n_class, num_valid_data
@@ -122,7 +134,55 @@ def augment_data(data, split_num, reflection):
     return data + augmented_data
 
 
-def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-1, return_type="pytorch"):
+def backtranslate(target_dir, dataset, dirpath, num_train):
+    dirname = os.path.basename(dirpath)
+    target_dir = os.path.join(target_dir, "%s_%d" % (dirname, num_train))
+    os.makedirs(target_dir, exist_ok=True)
+
+    train_df, valid_df = create_train_and_valid_dataset(dataset, dirpath, None, num_train, "pandas")
+    test_df = create_test_dataset(dataset, dirpath, None, "pandas")
+    valid_df.to_csv(os.path.join(target_dir, "valid.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
+    test_df.to_csv(os.path.join(target_dir, "test.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
+
+    # Pretrained translation model
+    en2ru = torch.hub.load('pytorch/fairseq', 'transformer.wmt19.en-ru.single_model', tokenizer='moses', bpe='fastbpe').cuda()
+    ru2en = torch.hub.load('pytorch/fairseq', 'transformer.wmt19.ru-en.single_model', tokenizer='moses', bpe='fastbpe').cuda()
+
+    def f(sentences):
+        sentences = [s[:1024] if len(s) > 1024 else s for s in sentences]
+        x = en2ru.translate(sentences, sampling=True, temperature=0.9)
+        x = [s[:1024] if len(s) > 1024 else s for s in x]
+        return ru2en.translate(x, sampling=True, temperature=0.9)
+
+    # Split sentence because translation model doesn't handle long text
+    augmented_inputs = defaultdict(list)
+    sentences = [(idx, s) for idx, row in train_df.iterrows() for s in sent_tokenize(row["input"])]
+
+    with torch.no_grad():
+        for batch_idx in tqdm(range(0, len(sentences), 128)):
+            batch = sentences[batch_idx:min(batch_idx+128, len(sentences))]
+            for i in range(5):
+                augmented_sentences = f([x[1] for x in batch])
+            
+                reconstructed_input = defaultdict(list)
+                for (idx, _), s in zip(sentences, augmented_sentences):
+                    reconstructed_input[idx].append(s)
+                
+                for k, v in reconstructed_input.items():
+                    augmented_inputs[k].append(' '.join(v))
+
+    train_df["augmented_inputs"] = train_df.index.map(augmented_inputs)
+    train_data = []
+    for idx, row in train_df.iterrows():
+        train_data.append({"label": row["label"], "input": row["input"]})
+        train_data.extend([{"label": row["label"], "input": x} for x in row["augmented_inputs"]])
+
+    train_df = pd.DataFrame(data=train_data)
+    # Save train data
+    train_df.to_csv(os.path.join(target_dir, "train.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
+
+
+def create_train_and_valid_dataset(dataset, dirpath, tokenizer=None, num_train_data=-1, return_type="pytorch"):
     """Create dataset for training script or analyzing data.
 
     :param dataset: The name of dataset
@@ -141,7 +201,10 @@ def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-
     """
 
     data_load_func, n_class, num_valid_data = create_metadata(dataset)
-    train_data = preprocess(data_load_func, os.path.join(dirpath, "train.csv"), tokenizer)
+    if tokenizer is None:
+        train_data = data_load_func(os.path.join(dirpath, "train.csv"))
+    else:
+        train_data = preprocess(data_load_func, os.path.join(dirpath, "train.csv"), tokenizer)
     # Stratified split
     train_data, valid_data = train_test_split(train_data, test_size=num_valid_data, random_state=42,
                                               shuffle=True, stratify=[x["label"] for x in train_data])
@@ -168,11 +231,78 @@ def create_train_and_valid_dataset(dataset, dirpath, tokenizer, num_train_data=-
     return train_dataset, valid_dataset
     
 
-def create_test_dataset(dataset, dirpath, tokenizer):
+def create_eda_train_and_valid_dataset(dataset, dirpath, tokenizer=None, num_train_data=-1, return_type="pytorch"):
+    """Create dataset for training script or analyzing data.
+
+    :param dataset: The name of dataset
+    :type dataset: str
+    :param dirpath: The directory path for actual raw data
+    :type dirpath: str
+    :param tokenizer: The tokenizer to tokenize real text into sequence of tokens
+    :type tokenizer: huggingface transformer package Tokenizer class
+    :param num_train_data: The number of available training data instances, defaults to -1 means the whole data
+    :type num_train_data: int, optional
+    :param return_type: The returned type, if "pytorch" means the data is represented as Dataset,
+                         if "pandas" means the data is represented as DataFrame, defaults to "pytorch"
+    :type return_type: str, optional
+    :return: [description]
+    :rtype: [type]
+    """
+    data_load_func, n_class, num_valid_data = create_metadata(dataset)
+    if tokenizer is None:
+        train_data = load_eda(os.path.join(dirpath, "train.csv"))
+        valid_data = load_eda(os.path.join(dirpath, "valid.csv"))
+    else:
+        train_data = preprocess(load_eda, os.path.join(dirpath, "train.csv"), tokenizer)
+        valid_data = preprocess(load_eda, os.path.join(dirpath, "valid.csv"), tokenizer)
+    # For only valid data, sort by length to accelerate inference
+    valid_data = sorted(valid_data, key=lambda x: len(x["input"]), reverse=True)
+    if num_train_data != -1:
+        _, train_data = train_test_split(train_data, test_size=num_train_data, random_state=42,
+                                         shuffle=True, stratify=[x["label"] for x in train_data])
+
+    # Calculate the observed token number
+    train_token = set(token for row in train_data for token in row["input"])
+    valid_token = set(token for row in valid_data for token in row["input"])
+    oov_token = valid_token - train_token
+    logging.info("Train observed token number: %d" % len(train_token))
+    logging.info("Valid observed token number: %d" % len(valid_token))
+    logging.info("Out of vocabulary token number: %d" % len(oov_token))
+    logging.info("Ouf of vocabulary rate: %.4f" % (len(oov_token) / len(valid_token)))
+    if return_type == "pytorch":
+        train_dataset = ListDataset(train_data, n_class)
+        valid_dataset = ListDataset(valid_data, n_class)
+    elif return_type == "pandas":
+        train_dataset = pd.DataFrame(data=train_data)
+        valid_dataset = pd.DataFrame(data=valid_data)
+    return train_dataset, valid_dataset
+
+
+def create_test_dataset(dataset, dirpath, tokenizer=None, return_type="pytorch"):
     data_load_func, n_class, _ = create_metadata(dataset)
-    test_data = preprocess(data_load_func, os.path.join(dirpath, "test.csv"), tokenizer)
+    if tokenizer is None:
+        test_data = data_load_func(os.path.join(dirpath, "test.csv"))
+    else:
+        test_data = preprocess(data_load_func, os.path.join(dirpath, "test.csv"), tokenizer)
     test_data = sorted(test_data, key=lambda x: len(x["input"]), reverse=True)
-    test_dataset = ListDataset(test_data, n_class)
+    if return_type == "pytorch":
+        test_dataset = ListDataset(test_data, n_class)
+    elif return_type == "pandas":
+        test_dataset = pd.DataFrame(data=test_data)
+    return test_dataset
+
+
+def create_eda_test_dataset(dataset, dirpath, tokenizer=None, return_type="pytorch"):
+    data_load_func, n_class, _ = create_metadata(dataset)
+    if tokenizer is None:
+        test_data = load_eda(os.path.join(dirpath, "test.csv"))
+    else:
+        test_data = preprocess(load_eda, os.path.join(dirpath, "test.csv"), tokenizer)
+    test_data = sorted(test_data, key=lambda x: len(x["input"]), reverse=True)
+    if return_type == "pytorch":
+        test_dataset = ListDataset(test_data, n_class)
+    elif return_type == "pandas":
+        test_dataset = pd.DataFrame(data=test_data)
     return test_dataset
 
 
@@ -206,3 +336,46 @@ class CollateFn:
             labels = torch.stack([x["label"] for x in batch])
         return {"idx": idx, "inputs": inputs, "labels": labels}
 
+
+def eda(eda_data_dir, dataset, dirpath, num_train):
+    dirname = os.path.basename(dirpath)
+    eda_dirpath = os.path.join(eda_data_dir, "%s_%d" % (dirname, num_train))
+    os.makedirs(eda_dirpath, exist_ok=True)
+
+    train_df, valid_df = create_train_and_valid_dataset(dataset, dirpath, None, num_train, "pandas")
+    test_df = create_test_dataset(dataset, dirpath, None, "pandas")
+    train_df.to_csv(os.path.join(eda_dirpath, "train.tsv"), columns=["label", "input"], sep='\t', index=False, header=False)
+
+    subprocess.run(["/home/sh0416/anaconda3/envs/python3.8/bin/python", "eda_nlp/code/augment.py", "--input", os.path.join(eda_dirpath, "train.tsv"), "--num_aug", "5"])
+    train_df = pd.read_csv(os.path.join(eda_dirpath, "eda_train.tsv"), names=["label", "input"], sep='\t')
+    train_df.to_csv(os.path.join(eda_dirpath, "train.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
+    valid_df.to_csv(os.path.join(eda_dirpath, "valid.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
+    test_df.to_csv(os.path.join(eda_dirpath, "test.csv"), columns=["label", "input"], sep=",", index=False, header=False, quoting=csv.QUOTE_ALL)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
+    data_dir = "/data/sh0416/dataset/pdistmix"
+    """
+    eda_data_dir = os.path.join(data_dir, "eda")
+    os.makedirs(eda_data_dir, exist_ok=True)
+    eda(eda_data_dir, "ag_news", os.path.join(data_dir, "ag_news_csv"), 2500)
+    eda(eda_data_dir, "ag_news", os.path.join(data_dir, "ag_news_csv"), 10000)
+    eda(eda_data_dir, "yahoo_answer", os.path.join(data_dir, "yahoo_answers_csv"), 2000)
+    eda(eda_data_dir, "yahoo_answer", os.path.join(data_dir, "yahoo_answers_csv"), 25000)
+    eda(eda_data_dir, "amazon_review_polarity", os.path.join(data_dir, "amazon_review_polarity_csv"), 2500)
+    eda(eda_data_dir, "amazon_review_polarity", os.path.join(data_dir, "amazon_review_polarity_csv"), 10000)
+    eda(eda_data_dir, "dbpedia", os.path.join(data_dir, "dbpedia_csv"), 2800)
+    eda(eda_data_dir, "dbpedia", os.path.join(data_dir, "dbpedia_csv"), 35000)
+    """
+
+    backtranslate_dir = os.path.join(data_dir, "backtranslate")
+    os.makedirs(backtranslate_dir, exist_ok=True)
+    #backtranslate(backtranslate_dir, "ag_news", os.path.join(data_dir, "ag_news_csv"), 2500)
+    #backtranslate(backtranslate_dir, "ag_news", os.path.join(data_dir, "ag_news_csv"), 10000)
+    #backtranslate(backtranslate_dir, "yahoo_answer", os.path.join(data_dir, "yahoo_answers_csv"), 2000)
+    #backtranslate(backtranslate_dir, "yahoo_answer", os.path.join(data_dir, "yahoo_answers_csv"), 25000)
+    #backtranslate(backtranslate_dir, "amazon_review_polarity", os.path.join(data_dir, "amazon_review_polarity_csv"), 2500)
+    backtranslate(backtranslate_dir, "amazon_review_polarity", os.path.join(data_dir, "amazon_review_polarity_csv"), 10000)
+    #backtranslate(backtranslate_dir, "dbpedia", os.path.join(data_dir, "dbpedia_csv"), 2800)
+    #backtranslate(backtranslate_dir, "dbpedia", os.path.join(data_dir, "dbpedia_csv"), 35000)
