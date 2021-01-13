@@ -16,7 +16,7 @@ from torchvision.utils import make_grid
 from transformers import BertModel, BertConfig, BertTokenizerFast
 import matplotlib
 import matplotlib.pyplot as plt
-from torchviz import make_dot
+#from torchviz import make_dot
 from tqdm import tqdm
 from data import create_train_and_valid_dataset, CollateFn
 from data import create_test_dataset
@@ -33,7 +33,7 @@ config = BertConfig.from_pretrained("bert-base-uncased")
 def calculate_normal_loss(model, criterion, input_ids, attention_mask, labels, epoch, step):
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
     loss = criterion(outputs, labels)
-    if step % 5 == 0:
+    if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Loss: %.4f" % (epoch, step, loss))
     return loss
 
@@ -49,7 +49,7 @@ def calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels, alp
     labels = (labels[:, None] == torch.arange(n_class, device=labels.device).view(1, n_class)).float()
     labels = lambda_ * labels + (1 - lambda_) * labels[mixup_indices]
     loss = criterion(F.log_softmax(outputs, dim=1), labels)
-    if step % 5 == 0:
+    if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Lambda: %.4f, Loss: %.4f" % (epoch, step, lambda_, loss))
     return loss
 
@@ -65,7 +65,7 @@ def calculate_adamix_loss(model, criterion, input_ids, attention_mask,
     loss22 = criterion(mix_outs, labels[mixup_indices])
     loss2 = (gamma * loss21 + (1 - gamma) * loss22).mean()
     loss = (loss1 + loss2) / 2
-    if step % 5 == 0:
+    if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Loss: %.4f" % (epoch, step, loss))
         logging.info("[Epoch %d, Step %d] Intrusion loss: %.4f" % (epoch, step, intr_loss))
     return loss, intr_loss

@@ -214,7 +214,7 @@ class PolicyRegionGenerator(nn.Module):
         sentence_h = masked_mean(h, attention_mask[:, :, None], dim=1)
         mix_sentence_h = torch.cat((sentence_h, sentence_h[mixup_indices]), dim=1)
         outputs = self.layer(mix_sentence_h)
-        logging.info("alpha: %.4f, Delta: %.4f" % (outputs[:, 0].mean(), outputs[:, 1].mean()))
+        #logging.info("alpha: %.4f, Delta: %.4f" % (outputs[:, 0].mean(), outputs[:, 1].mean()))
         return outputs[:, 1] * eps + outputs[:, 0]
 
 
@@ -253,7 +253,7 @@ class AdaMix(nn.Module):
                 if layer_idx == self.mixup_layer:
                     # Generate Policy Region Generator
                     gamma = self.policy_region_generator(h, attention_mask, mixup_indices, eps)  # [B]
-                    logging.info("gamma: %.4f" % gamma.mean())
+                    #logging.info("gamma: %.4f" % gamma.mean())
                     mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
                     mix_h = torch.where(attention_mask[:, :, None] & attention_mask[mixup_indices, :, None], mix_h, h)
                     #logging.info("h: %s" % h)
