@@ -132,25 +132,24 @@ def apply_backtranslate(data):
                  for idx2, s in enumerate(sent_tokenize(row["input"]))]
     sentences = sorted(sentences, key=lambda x: len(x[2]), reverse=True)
     with torch.no_grad():
-        for _ in range(1):
-            augmented_sentences = []
-            for idx in tqdm(range(0, len(sentences), 32), desc="backtranslate"):
-                batch = sentences[idx:min(idx+32, len(sentences))]
-                inputs = [s[2][:1024] if len(s[2])>1024 else s[2] for s in batch]
-                middle = en2ru.translate(inputs, beam=5)
-                middle = [s[:1024] if len(s)>1024 else s for s in middle]
-                new_inputs = ru2en.translate(middle, sampling=True)
-                augmented_sentences.extend(new_inputs)
-            augmented_sentences = [(idx, idx2, s)
-                                   for (idx, idx2, _), s in zip(sentences, augmented_sentences)]
-            augmented_sentences = sorted(augmented_sentences)
-            augmented_data = defaultdict(dict)
-            for idx, idx2, s in augmented_sentences:
-                augmented_data[idx][idx2] = s
-            augmented_data = {k: ' '.join([s for _, s in sorted(v.items())])
-                              for k, v in augmented_data.items()}
-            result.extend([{"input": v, "label": data[k]["label"]}
-                            for k, v in augmented_data.items()])
+        augmented_sentences = []
+        for idx in tqdm(range(0, len(sentences), 32), desc="backtranslate"):
+            batch = sentences[idx:min(idx+32, len(sentences))]
+            inputs = [s[2][:1024] if len(s[2])>1024 else s[2] for s in batch]
+            middle = en2ru.translate(inputs, beam=5)
+            middle = [s[:1024] if len(s)>1024 else s for s in middle]
+            new_inputs = ru2en.translate(middle, sampling=True)
+            augmented_sentences.extend(new_inputs)
+        augmented_sentences = [(idx, idx2, s)
+                                for (idx, idx2, _), s in zip(sentences, augmented_sentences)]
+        augmented_sentences = sorted(augmented_sentences)
+        augmented_data = defaultdict(dict)
+        for idx, idx2, s in augmented_sentences:
+            augmented_data[idx][idx2] = s
+        augmented_data = {k: ' '.join([s for _, s in sorted(v.items())])
+                            for k, v in augmented_data.items()}
+        result.extend([{"input": v, "label": data[k]["label"]}
+                        for k, v in augmented_data.items()])
     return result
 
 
@@ -177,9 +176,9 @@ def apply_augmentation(src_path: str, tgt_path: str, augmentation: str) -> None:
     return data
 
 
-def tokenize(src_path, tgt_path, tokenizer):
+def tokenize(load_f, src_path, tgt_path, tokenizer):
     if not os.path.exists(tgt_path):
-        data = list(load_csv(src_path))
+        data = list(load_f(src_path))
         for row in tqdm(data, desc="Tokenization"):
             row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=256, truncation=True)["input_ids"]))
         save_csv(tgt_path, data, ["input", "label"])
@@ -222,10 +221,12 @@ def create_train_and_valid_dataset(dataset, dirpath, augmentation=None, tokenize
                        os.path.join(CACHE_DIR, cache_path, "train_augmented.csv"),
                        augmentation)
     # 3. Tokenize given data
-    train_data = tokenize(os.path.join(CACHE_DIR, cache_path, "train_augmented.csv"),
+    train_data = tokenize(load_csv,
+                          os.path.join(CACHE_DIR, cache_path, "train_augmented.csv"),
                           os.path.join(CACHE_DIR, cache_path, "train_augmented_tokenized.csv"),
                           tokenizer)
-    valid_data = tokenize(os.path.join(CACHE_DIR, cache_path, "valid.csv"),
+    valid_data = tokenize(load_csv,
+                          os.path.join(CACHE_DIR, cache_path, "valid.csv"),
                           os.path.join(CACHE_DIR, cache_path, "valid_tokenized.csv"),
                           tokenizer)
     # Calculate the observed token number
@@ -247,10 +248,14 @@ def create_train_and_valid_dataset(dataset, dirpath, augmentation=None, tokenize
 
 def create_test_dataset(dataset, dirpath, tokenizer=None, return_type="pytorch"):
     data_load_func, n_class, _ = create_metadata(dataset)
-    if tokenizer is None:
-        test_data = data_load_func(os.path.join(dirpath, "test.csv"))
-    else:
-        test_data = preprocess(data_load_func, os.path.join(dirpath, "test.csv"), tokenizer)
+    cache_path = "%s" % (dataset)
+    # 0. Make cache directory
+    os.makedirs(os.path.join(CACHE_DIR, cache_path), exist_ok=True)
+    # 1. Tokenize given data
+    test_data = tokenize(data_load_func,
+                         os.path.join(dirpath, "test.csv"),
+                         os.path.join(CACHE_DIR, cache_path, "test_tokenized.csv"),
+                         tokenizer)
     test_data = sorted(test_data, key=lambda x: len(x["input"]), reverse=True)
     if return_type == "pytorch":
         test_dataset = ListDataset(test_data, n_class)
