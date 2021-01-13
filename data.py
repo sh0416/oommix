@@ -159,18 +159,19 @@ def apply_ssmba(train_data):
 
 def apply_augmentation(src_path: str, tgt_path: str, augmentation: str) -> None:
     if not os.path.exists(tgt_path):
-        if augmentation != "none":
-            data = list(load_csv(src_path))
-            if augmentation == "eda":
-                data = apply_eda(data)
-            elif augmentation == "backtranslate":
-                data = apply_backtranslate(data)
-            elif augmentation == "ssmba":
-                data = apply_ssmba(data)
-            else:
-                raise AttributeError()
-            # Overwrite existing training data to augmented one
-            save_csv(tgt_path, data, ["input", "label"])
+        data = list(load_csv(src_path))
+        if augmentation == "none":
+            pass
+        elif augmentation == "eda":
+            data = apply_eda(data)
+        elif augmentation == "backtranslate":
+            data = apply_backtranslate(data)
+        elif augmentation == "ssmba":
+            data = apply_ssmba(data)
+        else:
+            raise AttributeError()
+        # Overwrite existing training data to augmented one
+        save_csv(tgt_path, data, ["input", "label"])
     else:
         data = list(load_csv(tgt_path))
     return data
