@@ -281,7 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
-    args.exp_id = str(uuid.uuid4())[:8]
+    args.exp_id = str(uuid.uuid4())[:12]
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

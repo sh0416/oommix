@@ -75,6 +75,7 @@ def create_metadata(dataset):
         data_load_func = load_yahoo_answer
         n_class = 10
         num_valid_data = 5000 * n_class
+        #num_valid_data = 2000 * n_class
     elif dataset == "amazon_review_polarity":
         data_load_func = load_amazon_review_polarity
         n_class = 2
@@ -109,7 +110,7 @@ def apply_eda(train_data):
     train_df = pd.DataFrame(data=train_data)
     train_df.to_csv("eda_input.tsv", columns=["label", "input"], sep='\t',
                     index=False, header=False)
-    subprocess.run(["python", "eda_nlp/code/augment.py", "--num_aug", "5",
+    subprocess.run(["python", "eda_nlp/code/augment.py", "--num_aug", "1",
                     "--input", "eda_input.tsv", "--output", "eda_output.tsv"])
     train_df = pd.read_csv("eda_output.tsv", names=["label", "input"], sep='\t')
     train_data = [{"input": row["input"], "label": row["label"]}
@@ -154,7 +155,22 @@ def apply_backtranslate(data):
 
 
 def apply_ssmba(train_data):
-    raise NotImplementedError
+    with open("ssmba_input", 'w') as f, open("ssmba_label", "w") as f2:
+        for row in train_data:
+            f.write(row["input"] + '\n')
+            f2.write(str(row["label"]) + '\n')
+    subprocess.run(["python", "ssmba/ssmba.py", "--model", "bert-base-uncased",
+                    "--in-file", "ssmba_input", "--label-file", "ssmba_label", "--output-prefix", "ssmba_output",
+                    "--noise-prob", "0.25", "--num-samples", "1"])
+    with open("ssmba_output", "r") as f, open("ssmba_output.label", "r") as f2:
+        for inputs, labels in zip(f, f2):
+            train_data.append({"input": inputs, "label": int(labels)})
+    os.remove("ssmba_input")
+    os.remove("ssmba_label")
+    os.remove("ssmba_output")
+    os.remove("ssmba_output.label")
+    return train_data
+    
 
 
 def apply_augmentation(src_path: str, tgt_path: str, augmentation: str) -> None:
