@@ -41,6 +41,7 @@ def calculate_normal_loss(model, criterion, input_ids, attention_mask, labels, e
 def calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels, alpha, epoch, step):
     mixup_indices = torch.randperm(input_ids.shape[0], device=input_ids.device)
     lambda_ = np.random.beta(alpha, alpha)
+    lambda_ = np.where(lambda_>=0.5, lambda_, 1-lambda_)
     outputs = model(input_ids=input_ids,
                     attention_mask=attention_mask,
                     mixup_indices=mixup_indices,
@@ -55,7 +56,7 @@ def calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels, alp
 
 
 def calculate_adamix_loss(model, criterion, input_ids, attention_mask,
-                          labels, mixup_indices, eps, epoch, step):
+                          labels, mixup_indices, eps, epoch, step, writer):
     outs, mix_outs, gamma, intr_loss = model(input_ids=input_ids,
                                              attention_mask=attention_mask,
                                              mixup_indices=mixup_indices,
@@ -68,6 +69,8 @@ def calculate_adamix_loss(model, criterion, input_ids, attention_mask,
     if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Loss: %.4f" % (epoch, step, loss))
         logging.info("[Epoch %d, Step %d] Intrusion loss: %.4f" % (epoch, step, intr_loss))
+    for g in gamma.tolist():
+        writer.write("%d,%.4f\n" % (step, g))
     return loss, intr_loss
 
 
@@ -168,8 +171,8 @@ def train(args, report_func=None):
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
     elif args.augment == "adamix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
-                      optim.Adam(model.mix_model.policy_region_generator.parameters(), lr=1e-3),
-                      optim.Adam(model.mix_model.intrusion_classifier.parameters(), lr=1e-4),
+                      optim.Adam(model.mix_model.policy_region_generator.parameters(), lr=5e-5),
+                      optim.Adam(model.mix_model.intrusion_classifier.parameters(), lr=5e-5),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
 
     # Scheduler
@@ -178,7 +181,10 @@ def train(args, report_func=None):
 
     # Writer
     writer = SummaryWriter(os.path.join("run", args.exp_id))
+    os.makedirs("gamma", exist_ok=True)
+    writer2 = open(os.path.join("gamma", "%s_gamma.csv" % args.exp_id), "w")
 
+    logging.info("Tensorboard dir: %s" % os.path.join("run", args.exp_id))
     step, best_acc, patience = 0, 0, 0
     model.train()
     for optimizer in optimizers:
@@ -204,7 +210,7 @@ def train(args, report_func=None):
                 mixup_indices = torch.randperm(input_ids.shape[0], device=device)
                 eps = torch.rand(input_ids.shape[0], device=device)
                 loss, intr_loss = calculate_adamix_loss(model, criterion, input_ids,
-                        attention_mask, labels, mixup_indices, eps, epoch, step)
+                        attention_mask, labels, mixup_indices, eps, epoch, step, writer2)
                 #g = make_dot(loss, params=dict(model.named_parameters()))
                 #g.render('graph_loss', 'graph', format='png')
                 #g = make_dot(intr_loss, params=dict(model.named_parameters()))
@@ -247,7 +253,7 @@ def train(args, report_func=None):
         if patience == args.patience:
             break
     writer.close()
-
+    writer2.close()
 
 
 if __name__ == "__main__":
@@ -313,4 +319,6 @@ if __name__ == "__main__":
 
     os.makedirs("param", exist_ok=True)
     with open(os.path.join("param", args.exp_id+".json"), 'w') as f:
-        json.dump(vars(args), f, indent=2)
+        args = vars(args)
+        args["test_acc"] = test_acc
+        json.dump(args, f, indent=2)

@@ -315,10 +315,12 @@ class TMixSentenceClassificationModel(nn.Module):
         super().__init__()
         self.mix_model = mix_model
         self.classifier = create_sentence_classifier(mix_model.embedding_model.embed_dim, n_class)
+        self.sentence_h = nn.Identity()
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
         h = self.mix_model(input_ids, attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
-        return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
+        h = self.sentence_h(masked_mean(h, attention_mask[:, :, None], dim=1))
+        return self.classifier(h)
 
     def load(self):
         self.mix_model.embedding_model.load()
@@ -349,15 +351,19 @@ class AdaMixSentenceClassificationModel(nn.Module):
         super().__init__()
         self.mix_model = mix_model
         self.classifier = create_sentence_classifier(mix_model.embedding_model.embed_dim, n_class)
+        self.sentence_h = nn.Identity("sentence embedding")
+        self.mix_sentence_h = nn.Identity("mixed sentence embedding")
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
         if mixup_indices is None:
             h = self.mix_model(input_ids, attention_mask)
-            return self.classifier(torch.mean(h, dim=1))
+            return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
         else:
             h, mix_h, gamma, intr_loss = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
-            out = self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
-            mix_out = self.classifier(masked_mean(mix_h, attention_mask[:, :, None], dim=1))
+            h = self.sentence_h(masked_mean(h, attention_mask[:, :, None], dim=1))
+            mix_h = self.mix_sentence_h(masked_mean(mix_h, attention_mask[:, :, None], dim=1))
+            out = self.classifier(h)
+            mix_out = self.classifier(mix_h)
             return out, mix_out, gamma, intr_loss
         
     def load(self):

@@ -7,3 +7,7 @@ __pycache__/
 cache/
 log/
 ckpt/
+param/
+res/
+run/
+gamma/
