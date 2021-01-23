@@ -295,12 +295,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--drop_prob", type=float, default=0.1)
     # Train hyperparameter - augmentation
-    parser.add_argument("--mix_strategy", type=str, choices=["none", "tmix", "nonlinearmix", "adamix"], default="none")
+    parser.add_argument("--mix_strategy", type=str, choices=["none", "tmix", "nonlinearmix", "mixuptransformer", "adamix"], default="none")
     parser.add_argument("--m_layer", type=int, default=3)
     parser.add_argument("--d_layer", type=int, default=12)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--coeff_intr", type=float, default=0.5)
-    parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--eval_every", type=int, default=100)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--gpu", type=int, default=0)
@@ -333,15 +332,15 @@ if __name__ == "__main__":
                          intrusion_layer=args.d_layer,
                          n_class=test_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
     model.to(device)
-    model.load_state_dict(torch.load(os.path.join("ckpt", "model_%s.pth" % args.exp_id)))
+    model.load_state_dict(torch.load(os.path.join("out", "ckpt", "model_%s.pth" % args.exp_id)))
 
     test_acc = evaluate(model, test_loader, device)
     for k, v in vars(args).items():
         logging.info("Parameter %s = %s" % (k, str(v)))
     logging.info("Test accuracy: %.4f" % test_acc)
 
-    os.makedirs("param", exist_ok=True)
-    with open(os.path.join("param", args.exp_id+".json"), 'w') as f:
+    os.makedirs(os.path.join("out", "param"), exist_ok=True)
+    with open(os.path.join("out", "param", args.exp_id+".json"), 'w') as f:
         args = vars(args)
         args["test_acc"] = test_acc
         json.dump(args, f, indent=2)
