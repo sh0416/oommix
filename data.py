@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from filelock import FileLock
 
 nltk.download('punkt')
 
@@ -92,18 +93,20 @@ def create_metadata(dataset):
 CACHE_DIR = "/data/sh0416/cache"
 
 def split_train_validation(load_f, src_path: str, tgt_train_path: str, tgt_valid_path: str, num_train_data: int, num_valid_data: int) -> None:
-    if not os.path.exists(tgt_train_path) or not os.path.exists(tgt_valid_path):
-        train_data = load_f(src_path)
-        train_data, valid_data = train_test_split(train_data, test_size=num_valid_data, random_state=42,
-                                                  shuffle=True, stratify=[x["label"] for x in train_data])
-        # Sample training data
-        if num_train_data != -1:
-            _, train_data = train_test_split(train_data, test_size=num_train_data, random_state=42,
-                                            shuffle=True, stratify=[x["label"] for x in train_data])
-        # For valid data, sort by length to accelerate inference
-        valid_data = sorted(valid_data, key=lambda x: len(x["input"]), reverse=True)
-        save_csv(tgt_train_path, train_data, ["input", "label"])
-        save_csv(tgt_valid_path, valid_data, ["input", "label"])
+    with FileLock(tgt_train_path+'.lock') as tgt_train_lock, \
+        FileLock(tgt_valid_path+'.lock') as tgt_valid_lock:
+        if not os.path.exists(tgt_train_path) or not os.path.exists(tgt_valid_path):
+            train_data = load_f(src_path)
+            train_data, valid_data = train_test_split(train_data, test_size=num_valid_data, random_state=42,
+                                                    shuffle=True, stratify=[x["label"] for x in train_data])
+            # Sample training data
+            if num_train_data != -1:
+                _, train_data = train_test_split(train_data, test_size=num_train_data, random_state=42,
+                                                shuffle=True, stratify=[x["label"] for x in train_data])
+            # For valid data, sort by length to accelerate inference
+            valid_data = sorted(valid_data, key=lambda x: len(x["input"]), reverse=True)
+            save_csv(tgt_train_path, train_data, ["input", "label"])
+            save_csv(tgt_valid_path, valid_data, ["input", "label"])
     
 
 def apply_eda(train_data):
@@ -155,57 +158,60 @@ def apply_backtranslate(data):
 
 
 def apply_ssmba(train_data):
-    with open("ssmba_input", 'w') as f, open("ssmba_label", "w") as f2:
-        for row in train_data:
-            f.write(row["input"] + '\n')
-            f2.write(str(row["label"]) + '\n')
-    subprocess.run(["python", "ssmba/ssmba.py", "--model", "bert-base-uncased",
-                    "--in-file", "ssmba_input", "--label-file", "ssmba_label", "--output-prefix", "ssmba_output",
-                    "--noise-prob", "0.25", "--num-samples", "1"])
-    with open("ssmba_output", "r") as f, open("ssmba_output.label", "r") as f2:
-        for inputs, labels in zip(f, f2):
-            train_data.append({"input": inputs, "label": int(labels)})
+    with FileLock("ssmba.lock") as lock:
+        with open("ssmba_input", 'w') as f, open("ssmba_label", "w") as f2:
+            for row in train_data:
+                f.write(row["input"] + '\n')
+                f2.write(str(row["label"]) + '\n')
+        subprocess.run(["python", "ssmba/ssmba.py", "--model", "bert-base-uncased",
+                        "--in-file", "ssmba_input", "--label-file", "ssmba_label", "--output-prefix", "ssmba_output",
+                        "--noise-prob", "0.25", "--num-samples", "1"])
+        with open("ssmba_output", "r") as f, open("ssmba_output.label", "r") as f2:
+            for inputs, labels in zip(f, f2):
+                train_data.append({"input": inputs, "label": int(labels)})
     os.remove("ssmba_input")
     os.remove("ssmba_label")
     os.remove("ssmba_output")
     os.remove("ssmba_output.label")
+    os.remove("ssmba.lock")
     return train_data
-    
 
 
 def apply_augmentation(src_path: str, tgt_path: str, augmentation: str) -> None:
-    if not os.path.exists(tgt_path):
-        data = list(load_csv(src_path))
-        if augmentation == "none":
-            pass
-        elif augmentation == "eda":
-            data = apply_eda(data)
-        elif augmentation == "backtranslate":
-            data = apply_backtranslate(data)
-        elif augmentation == "ssmba":
-            data = apply_ssmba(data)
+    with FileLock(tgt_path+".lock") as lock:
+        if not os.path.exists(tgt_path):
+            data = list(load_csv(src_path))
+            if augmentation == "none":
+                pass
+            elif augmentation == "eda":
+                data = apply_eda(data)
+            elif augmentation == "backtranslate":
+                data = apply_backtranslate(data)
+            elif augmentation == "ssmba":
+                data = apply_ssmba(data)
+            else:
+                raise AttributeError()
+            # Overwrite existing training data to augmented one
+            save_csv(tgt_path, data, ["input", "label"])
         else:
-            raise AttributeError()
-        # Overwrite existing training data to augmented one
-        save_csv(tgt_path, data, ["input", "label"])
-    else:
-        data = list(load_csv(tgt_path))
+            data = list(load_csv(tgt_path))
     return data
 
 
 def tokenize(load_f, src_path, tgt_path, tokenizer):
-    if not os.path.exists(tgt_path):
-        data = list(load_f(src_path))
-        for row in tqdm(data, desc="Tokenization"):
-            row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=256, truncation=True)["input_ids"]))
-        save_csv(tgt_path, data, ["input", "label"])
-    else:
-        data = load_csv(tgt_path)
+    with FileLock(tgt_path+".lock") as lock:
+        if not os.path.exists(tgt_path):
+            data = list(load_f(src_path))
+            for row in tqdm(data, desc="Tokenization"):
+                row["input"] = ' '.join(map(str, tokenizer(row["input"], max_length=256, truncation=True)["input_ids"]))
+            save_csv(tgt_path, data, ["input", "label"])
+        else:
+            data = load_csv(tgt_path)
     return [{"input": list(map(int, row["input"].split(' '))), "label": int(row["label"])}
             for row in data]
 
 
-def create_train_and_valid_dataset(dataset, dirpath, augmentation=None, tokenizer=None, num_train_data=-1, return_type="pytorch"):
+def create_train_and_valid_dataset(dataset, dirpath, augmentation='none', tokenizer=None, num_train_data=-1, return_type="pytorch"):
     """Create dataset for training script or analyzing data.
 
     :param dataset: The name of dataset

@@ -21,11 +21,10 @@ from tqdm import tqdm
 from data import create_train_and_valid_dataset, CollateFn
 from data import create_test_dataset
 from model import create_model
-from utils import Collector
+from utils import Collector, gram_schmidt
 
 matplotlib.use('Agg')
 #torch.set_printoptions(profile="full", linewidth=150)
-#wandb.init(project='pdistmix')
 
 config = BertConfig.from_pretrained("bert-base-uncased")
 
@@ -52,6 +51,21 @@ def calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels, alp
     loss = criterion(F.log_softmax(outputs, dim=1), labels)
     if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Lambda: %.4f, Loss: %.4f" % (epoch, step, lambda_, loss))
+    return loss
+
+
+def calculate_nonlinearmix_loss(model, criterion, input_ids, attention_mask, labels, alpha, epoch, step):
+    mixup_indices = torch.randperm(input_ids.shape[0], device=input_ids.device)
+    lambda_ = np.random.beta(alpha, alpha,
+            size=(input_ids.shape[0], input_ids.shape[1], model.get_embedding_model().embed_dim))
+    lambda_ = torch.from_numpy(lambda_).float().to(input_ids.device)
+    out, phi = model(input_ids, attention_mask, mixup_indices, lambda_) # [B, D_L]
+    l1 = model.get_label_embedding(labels)
+    l2 = model.get_label_embedding(labels[mixup_indices])
+    mix_l = l1 * phi + (1 - phi) * l2   # [B, D_L]
+    loss = -F.cosine_similarity(out, mix_l).mean()
+    if step % 10 == 0:
+        logging.info("[Epoch %d, Step %d] Loss: %.4f" % (epoch, step, loss))
     return loss
 
 
@@ -113,8 +127,8 @@ def evaluate(model, loader, device):
             input_ids = batch["inputs"]["input_ids"].to(device) 
             attention_mask = batch["inputs"]["attention_mask"].to(device) 
             labels = batch["labels"].to(device)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            pred = outputs.argmax(dim=1)
+            pred = model.predict(input_ids=input_ids, attention_mask=attention_mask)
+            #pred = outputs.argmax(dim=1)
             correct += (labels == pred).float().sum()
             count += labels.shape[0]    
         acc = correct / count
@@ -142,34 +156,37 @@ def train(args, report_func=None):
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(torch.cuda.current_device())
 
     # Model
-    model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
-                         intrusion_layer=args.intrusion_layer,
+    model = create_model(augment=args.mix_strategy, mixup_layer=args.m_layer,
+                         intrusion_layer=args.d_layer,
                          n_class=train_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
     model.load()     # Load BERT pretrained weight
     model.to(device)
 
     # Criterion
-    if args.augment == "none":
+    if args.mix_strategy == "none":
         criterion = nn.CrossEntropyLoss()
-    elif args.augment == "tmix":
+    elif args.mix_strategy == "tmix":
         criterion = nn.KLDivLoss(reduction="batchmean")
+    elif args.mix_strategy == "nonlinearmix":
+        criterion = None
     else:
         criterion = nn.CrossEntropyLoss()
 
     # Optimizer
-    if args.augment == "none":
+    if args.mix_strategy == "none":
         optimizers = [optim.Adam(model.embedding_model.parameters(), lr=args.lr),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
-    elif args.augment == "tmix":
+    elif args.mix_strategy == "tmix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
-    elif args.augment == "shufflemix":
+    elif args.mix_strategy == "nonlinearmix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
-                      optim.Adam(model.classifier.parameters(), lr=1e-3)]
-    elif args.augment == "adamix":
+                      optim.Adam(model.mix_model.policy_mapping_f.parameters(), lr=2e-5),
+                      optim.Adam(model.classifier.parameters(), lr=1e-3),
+                      optim.Adam([model.label_matrix], lr=1e-3)]
+    elif args.mix_strategy == "adamix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
                       optim.Adam(model.mix_model.policy_region_generator.parameters(), lr=5e-5),
                       optim.Adam(model.mix_model.intrusion_classifier.parameters(), lr=5e-5),
@@ -180,11 +197,13 @@ def train(args, report_func=None):
                   for optimizer in optimizers]
 
     # Writer
-    writer = SummaryWriter(os.path.join("run", args.exp_id))
-    os.makedirs("gamma", exist_ok=True)
-    writer2 = open(os.path.join("gamma", "%s_gamma.csv" % args.exp_id), "w")
+    writer = SummaryWriter(os.path.join("out", "run", args.exp_id))
+    logging.info("Tensorboard dir: %s" % os.path.join("out", "run", args.exp_id))
 
-    logging.info("Tensorboard dir: %s" % os.path.join("run", args.exp_id))
+    # Gamma
+    os.makedirs(os.path.join("out", "gamma"), exist_ok=True)
+    writer2 = open(os.path.join("out", "gamma", "%s_gamma.csv" % args.exp_id), "w")
+
     step, best_acc, patience = 0, 0, 0
     model.train()
     for optimizer in optimizers:
@@ -194,31 +213,25 @@ def train(args, report_func=None):
             input_ids = batch["inputs"]["input_ids"].to(device) 
             attention_mask = batch["inputs"]["attention_mask"].to(device) 
             labels = batch["labels"].to(device)
-            if args.augment == "none":
+            if args.mix_strategy == "none":
                 loss = calculate_normal_loss(model, criterion, input_ids, attention_mask, labels,
                                              epoch, step)
                 loss.backward()
-            elif args.augment == "tmix":
+            elif args.mix_strategy == "tmix":
                 loss = calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels,
                                            args.alpha, epoch, step)
                 loss.backward()
-            elif args.augment == "shufflemix":
-                loss = calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels,
-                                           args.alpha, epoch, step)
+            elif args.mix_strategy == "nonlinearmix":
+                loss = calculate_nonlinearmix_loss(model, criterion, input_ids, attention_mask, labels,
+                                                   args.alpha, epoch, step)
                 loss.backward()
-            elif args.augment == "adamix":
+            elif args.mix_strategy == "adamix":
                 mixup_indices = torch.randperm(input_ids.shape[0], device=device)
                 eps = torch.rand(input_ids.shape[0], device=device)
                 loss, intr_loss = calculate_adamix_loss(model, criterion, input_ids,
                         attention_mask, labels, mixup_indices, eps, epoch, step, writer2)
-                #g = make_dot(loss, params=dict(model.named_parameters()))
-                #g.render('graph_loss', 'graph', format='png')
-                #g = make_dot(intr_loss, params=dict(model.named_parameters()))
-                #g.render('graph_intr_loss', 'graph', format='png')
                 # Order is important! Update intrusion parameter and 
                 (args.coeff_intr*intr_loss).backward(retain_graph=True)
-                #g = make_dot(loss, params=dict(model.named_parameters()))
-                #g.render('graph_loss_after_backward', 'graph', format='png')
                 optimizers[0].zero_grad()
                 # Order is important! Update model
                 ((1-args.coeff_intr)*loss).backward()
@@ -231,6 +244,11 @@ def train(args, report_func=None):
                 optimizer.zero_grad()
             for scheduler in schedulers:
                 scheduler.step()
+            if args.mix_strategy == "nonlinearmix":
+                # Apply gram schmidt
+                with torch.no_grad():
+                    gs = torch.from_numpy(gram_schmidt(model.label_matrix.t().cpu().numpy())).t().to(device)
+                    model.label_matrix.copy_(gs)
             
             step += 1
             if step % 50 == 0:
@@ -241,8 +259,8 @@ def train(args, report_func=None):
                 if best_acc < acc:
                     best_acc = acc
                     patience = 0
-                    os.makedirs("ckpt", exist_ok=True)
-                    torch.save(model.state_dict(), os.path.join("ckpt", "./model_%s.pth" % args.exp_id))
+                    os.makedirs(os.path.join("out", "ckpt"), exist_ok=True)
+                    torch.save(model.state_dict(), os.path.join("out", "ckpt", "./model_%s.pth" % args.exp_id))
                 else:
                     patience += 1
                 logging.info("Accuracy: %.4f, Best accuracy: %.4f" % (acc, best_acc))
@@ -277,9 +295,9 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--drop_prob", type=float, default=0.1)
     # Train hyperparameter - augmentation
-    parser.add_argument("--augment", type=str, choices=["none", "tmix", "shufflemix", "adamix"], default="none")
-    parser.add_argument("--mixup_layer", type=int, default=3)
-    parser.add_argument("--intrusion_layer", type=int, default=12)
+    parser.add_argument("--mix_strategy", type=str, choices=["none", "tmix", "nonlinearmix", "adamix"], default="none")
+    parser.add_argument("--m_layer", type=int, default=3)
+    parser.add_argument("--d_layer", type=int, default=12)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--coeff_intr", type=float, default=0.5)
     parser.add_argument("--save_every", type=int, default=100)
@@ -291,7 +309,12 @@ if __name__ == "__main__":
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
+    
+    os.makedirs(os.path.join("out", "log"), exist_ok=True)
+    logging.basicConfig(level=logging.INFO,
+                        filename=os.path.join("out", "log", args.exp_id),
+                        format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
+    #logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
     train(args)
 
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
@@ -306,8 +329,8 @@ if __name__ == "__main__":
         torch.cuda.set_device(args.gpu)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(torch.cuda.current_device())
-    model = create_model(augment=args.augment, mixup_layer=args.mixup_layer,
-                         intrusion_layer=args.intrusion_layer,
+    model = create_model(augment=args.mix_strategy, mixup_layer=args.m_layer,
+                         intrusion_layer=args.d_layer,
                          n_class=test_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
     model.to(device)
     model.load_state_dict(torch.load(os.path.join("ckpt", "model_%s.pth" % args.exp_id)))

@@ -1,5 +1,5 @@
+import numpy as np
 
-    
 class Collector:
     def __init__(self):
         self.activations = {}
@@ -29,3 +29,7 @@ class Collector:
         for handle in self.handles.values():
             handle.remove()
 
+
+def gram_schmidt(X):
+    Q, R = np.linalg.qr(X)
+    return Q

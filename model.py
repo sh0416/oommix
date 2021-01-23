@@ -144,11 +144,15 @@ class TMix(nn.Module):
         return h
 
 
-class ShuffleMix(nn.Module):
-    def __init__(self, embedding_model, mixup_layer=0):
+class NonlinearMix(nn.Module):
+    def __init__(self, embedding_model, mixup_layer=0, max_length=256, d_label=100):
         super().__init__()
         self.embedding_model = embedding_model
         self.mixup_layer = mixup_layer
+        self.policy_mapping_f = nn.Sequential(
+            nn.Linear(embedding_model.embed_dim*max_length, d_label),
+            nn.Sigmoid())
+        self.max_length = max_length
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
         with torch.no_grad():
@@ -156,45 +160,19 @@ class ShuffleMix(nn.Module):
         for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
             h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
         if mixup_indices is not None:
-            h2, attention_mask2 = h[mixup_indices], attention_mask[mixup_indices]
-            # Shuffle row-wise. To avoid non zero probability for padding mask, we add epsilon
-            sequence_indices = torch.multinomial(attention_mask2.float()+1e-7,
-                                                 num_samples=attention_mask2.shape[1],
-                                                 replacement=True)
-            h2 = torch.gather(h2, dim=1, index=sequence_indices[:, :, None].expand(-1, -1, h2.shape[2]))
-            #h = torch.where(attention_mask[:, :, None] & attention_mask2[:, :, None],
-            #                lambda_ * h + (1 - lambda_) * h2, h)
-            h = torch.where(attention_mask[:, :, None],
-                            lambda_ * h + (1 - lambda_) * h2, h)
+            assert all(x == y for x, y in zip(h.shape, lambda_.shape))
+            h = lambda_ * h + (1 - lambda_) * h[mixup_indices]
+            policy_input = F.pad(h, pad=(0, 0, 0, self.max_length-h.shape[1]))
+            logging.debug("policy input shape: %s" % str(policy_input.shape))
+            policy_input = policy_input.view(policy_input.shape[0], -1)
+            # Policy mapping function F for mixing label embedding vector
+            phi = self.policy_mapping_f(policy_input)
         for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
             h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
-        return h
-
-
-class ProposedMix(nn.Module):
-    def __init__(self, embedding_model, mixup_layer=0):
-        super().__init__()
-        self.embedding_model = embedding_model
-        self.mixup_layer = mixup_layer
-        self.memory_k = nn.Parameter(torch.zeros(10, self.embedding_model.embed_dim),
-                                     False)
-        self.memory_v = nn.Parameter(torch.zeros(10, self.embedding_model.embed_dim),
-                                     False)
-
-    def forward(self, input_ids, attention_mask, idx=None, mixup_indices=None, lambda_=None):
-        with torch.no_grad():
-            h = self.embedding_model.forward_embedding(input_ids)
-        for module_dict in self.embedding_model.encoder[:self.mixup_layer]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
-        if mixup_indices is not None:
-            if idx is not None:
-                h = torch.gather(h, dim=1, index=idx[:, :, None].expand(-1, -1, h.shape[2]))
-                attention_mask = torch.gather(attention_mask, dim=1, index=idx)
-            mix_h = torch.where(attention_mask[:, :, None], h[mixup_indices], h)
-            h = lambda_ * h + (1 - lambda_) * mix_h
-        for module_dict in self.embedding_model.encoder[self.mixup_layer:]:
-            h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
-        return h
+        if mixup_indices is None:
+            return h
+        else:
+            return h, phi
 
 
 class PolicyRegionGenerator(nn.Module):
@@ -311,10 +289,10 @@ class SentenceClassificationModel(nn.Module):
 
 
 class TMixSentenceClassificationModel(nn.Module):
-    def __init__(self, mix_model, n_class):
+    def __init__(self, embedding_model, mixup_layer, n_class):
         super().__init__()
-        self.mix_model = mix_model
-        self.classifier = create_sentence_classifier(mix_model.embedding_model.embed_dim, n_class)
+        self.mix_model = TMix(embedding_model, mixup_layer=mixup_layer)
+        self.classifier = create_sentence_classifier(embedding_model.embed_dim, n_class)
         self.sentence_h = nn.Identity()
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
@@ -329,15 +307,35 @@ class TMixSentenceClassificationModel(nn.Module):
         return self.mix_model.embedding_model
 
 
-class ShuffleMixSentenceClassificationModel(nn.Module):
-    def __init__(self, mix_model, n_class):
+class NonlinearMixSentenceClassificationModel(nn.Module):
+    def __init__(self, embedding_model, mixup_layer, max_length, d_class, n_class):
         super().__init__()
-        self.mix_model = mix_model
-        self.classifier = create_sentence_classifier(mix_model.embedding_model.embed_dim, n_class)
+        self.mix_model = NonlinearMix(embedding_model,
+                                      mixup_layer=mixup_layer,
+                                      max_length=max_length,
+                                      d_label=d_class)
+        self.classifier = create_sentence_classifier(embedding_model.embed_dim, d_class)
+        self.label_matrix = nn.Parameter(torch.randn(n_class, d_class))
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
-        h = self.mix_model(input_ids, attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
-        return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
+        if mixup_indices is None:
+            h = self.mix_model(input_ids, attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
+            return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
+        else:
+            h, phi = self.mix_model(input_ids, attention_mask, mixup_indices=mixup_indices, lambda_=lambda_)
+            return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1)), phi
+
+    def predict(self, input_ids, attention_mask):
+        h = self.mix_model(input_ids, attention_mask)
+        h = self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1)) # [B, D]
+        h = h / h.norm(dim=1, keepdim=True)
+        l = self.label_matrix / self.label_matrix.norm(dim=1, keepdim=True)
+        out = torch.mm(h, l.t())  # [B, C]
+        pred = out.argmax(dim=1)
+        return pred
+
+    def get_label_embedding(self, labels):
+        return self.label_matrix[labels]
 
     def load(self):
         self.mix_model.embedding_model.load()
@@ -357,7 +355,8 @@ class AdaMixSentenceClassificationModel(nn.Module):
     def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
         if mixup_indices is None:
             h = self.mix_model(input_ids, attention_mask)
-            return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
+            h = self.sentence_h(masked_mean(h, attention_mask[:, :, None], dim=1))
+            return self.classifier(h)
         else:
             h, mix_h, gamma, intr_loss = self.mix_model(input_ids, attention_mask, mixup_indices, eps)
             h = self.sentence_h(masked_mean(h, attention_mask[:, :, None], dim=1))
@@ -375,18 +374,20 @@ class AdaMixSentenceClassificationModel(nn.Module):
 
 def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, n_head=12,
                  k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, augment='none', 
-                 mixup_layer=3, intrusion_layer=6, n_class=4):
+                 mixup_layer=3, max_length=256, d_class=16, intrusion_layer=6, n_class=4):
     embedding_model = Bert(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
                            drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
                            feedforward_dim=feedforward_dim, n_layer=n_layer)
     if augment == "none":
         model = SentenceClassificationModel(embedding_model, n_class)
     elif augment == "tmix":
-        embedding_model = TMix(embedding_model, mixup_layer=mixup_layer)
-        model = TMixSentenceClassificationModel(embedding_model, n_class)
-    elif augment == "shufflemix":
-        embedding_model = ShuffleMix(embedding_model, mixup_layer=mixup_layer)
-        model = ShuffleMixSentenceClassificationModel(embedding_model, n_class)
+        model = TMixSentenceClassificationModel(embedding_model, mixup_layer=mixup_layer, n_class=n_class)
+    elif augment == "nonlinearmix":
+        model = NonlinearMixSentenceClassificationModel(embedding_model,
+                                                        max_length=max_length,
+                                                        mixup_layer=mixup_layer,
+                                                        d_class=d_class,
+                                                        n_class=n_class)
     elif augment == "adamix":
         embedding_model = AdaMix(embedding_model, mixup_layer=mixup_layer,
                                  intrusion_layer=intrusion_layer)
