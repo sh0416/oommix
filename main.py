@@ -40,7 +40,7 @@ def calculate_normal_loss(model, criterion, input_ids, attention_mask, labels, e
 def calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels, alpha, epoch, step):
     mixup_indices = torch.randperm(input_ids.shape[0], device=input_ids.device)
     lambda_ = np.random.beta(alpha, alpha)
-    lambda_ = np.where(lambda_>=0.5, lambda_, 1-lambda_)
+    lambda_ = torch.tensor(np.where(lambda_>=0.5, lambda_, 1-lambda_), dtype=torch.float, device=input_ids.device)
     outputs = model(input_ids=input_ids,
                     attention_mask=attention_mask,
                     mixup_indices=mixup_indices,
@@ -69,7 +69,23 @@ def calculate_nonlinearmix_loss(model, criterion, input_ids, attention_mask, lab
     return loss
 
 
-def calculate_adamix_loss(model, criterion, input_ids, attention_mask,
+def calculate_mixuptransformer_loss(model, criterion, input_ids, attention_mask, labels, epoch, step):
+    mixup_indices = torch.randperm(input_ids.shape[0], device=input_ids.device)
+    lambda_ = 0.5
+    outputs = model(input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    mixup_indices=mixup_indices,
+                    lambda_=lambda_)
+    n_class = outputs.shape[1]
+    labels = (labels[:, None] == torch.arange(n_class, device=labels.device).view(1, n_class)).float()
+    labels = lambda_ * labels + (1 - lambda_) * labels[mixup_indices]
+    loss = criterion(F.log_softmax(outputs, dim=1), labels)
+    if step % 10 == 0:
+        logging.info("[Epoch %d, Step %d] Lambda: %.4f, Loss: %.4f" % (epoch, step, lambda_, loss))
+    return loss
+
+
+def calculate_oommix_loss(model, criterion, input_ids, attention_mask,
                           labels, mixup_indices, eps, epoch, step, writer):
     outs, mix_outs, gamma, intr_loss = model(input_ids=input_ids,
                                              attention_mask=attention_mask,
@@ -171,6 +187,8 @@ def train(args, report_func=None):
         criterion = nn.KLDivLoss(reduction="batchmean")
     elif args.mix_strategy == "nonlinearmix":
         criterion = None
+    elif args.mix_strategy == "mixuptransformer":
+        criterion = nn.KLDivLoss(reduction="batchmean")
     else:
         criterion = nn.CrossEntropyLoss()
 
@@ -186,10 +204,13 @@ def train(args, report_func=None):
                       optim.Adam(model.mix_model.policy_mapping_f.parameters(), lr=2e-5),
                       optim.Adam(model.classifier.parameters(), lr=1e-3),
                       optim.Adam([model.label_matrix], lr=1e-3)]
-    elif args.mix_strategy == "adamix":
+    elif args.mix_strategy == "mixuptransformer":
+        optimizers = [optim.Adam(model.embedding_model.parameters(), lr=args.lr),
+                      optim.Adam(model.classifier.parameters(), lr=1e-3)]
+    elif args.mix_strategy == "oommix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
-                      optim.Adam(model.mix_model.policy_region_generator.parameters(), lr=5e-5),
-                      optim.Adam(model.mix_model.intrusion_classifier.parameters(), lr=5e-5),
+                      optim.Adam(model.mix_model.policy_region_generator.parameters(), lr=2e-5),
+                      optim.Adam(model.mix_model.intrusion_classifier.parameters(), lr=2e-5),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
 
     # Scheduler
@@ -225,10 +246,14 @@ def train(args, report_func=None):
                 loss = calculate_nonlinearmix_loss(model, criterion, input_ids, attention_mask, labels,
                                                    args.alpha, epoch, step)
                 loss.backward()
-            elif args.mix_strategy == "adamix":
+            elif args.mix_strategy == "mixuptransformer":
+                loss = calculate_mixuptransformer_loss(model, criterion, input_ids, attention_mask, labels,
+                                                       epoch, step)
+                loss.backward()
+            elif args.mix_strategy == "oommix":
                 mixup_indices = torch.randperm(input_ids.shape[0], device=device)
                 eps = torch.rand(input_ids.shape[0], device=device)
-                loss, intr_loss = calculate_adamix_loss(model, criterion, input_ids,
+                loss, intr_loss = calculate_oommix_loss(model, criterion, input_ids,
                         attention_mask, labels, mixup_indices, eps, epoch, step, writer2)
                 # Order is important! Update intrusion parameter and 
                 (args.coeff_intr*intr_loss).backward(retain_graph=True)
@@ -290,12 +315,13 @@ if __name__ == "__main__":
     # Model hyperparameter
     parser.add_argument("--restore", type=str)
     # Train hyperparameter
-    parser.add_argument("--epoch", type=int, default=1000)
+    parser.add_argument("--epoch", type=int, default=5000)
     parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--drop_prob", type=float, default=0.1)
     # Train hyperparameter - augmentation
-    parser.add_argument("--mix_strategy", type=str, choices=["none", "tmix", "nonlinearmix", "mixuptransformer", "adamix"], default="none")
+    parser.add_argument("--mix_strategy", type=str,
+                        choices=["none", "tmix", "nonlinearmix", "mixuptransformer", "oommix"], default="none")
     parser.add_argument("--m_layer", type=int, default=3)
     parser.add_argument("--d_layer", type=int, default=12)
     parser.add_argument("--alpha", type=float, default=0.2)
@@ -311,7 +337,8 @@ if __name__ == "__main__":
     
     os.makedirs(os.path.join("out", "log"), exist_ok=True)
     logging.basicConfig(level=logging.INFO,
-                        filename=os.path.join("out", "log", args.exp_id),
+                        stream=sys.stdout,
+                        #filename=os.path.join("out", "log", args.exp_id),
                         format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
     #logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
     train(args)

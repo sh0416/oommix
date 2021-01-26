@@ -213,7 +213,7 @@ class IntrusionClassifier(nn.Module):
         return self.classifier(h)
 
 
-class AdaMix(nn.Module):
+class OoMMix(nn.Module):
     def __init__(self, embedding_model, mixup_layer=0, intrusion_layer=0):
         super().__init__()
         self.embedding_model = embedding_model
@@ -281,6 +281,10 @@ class SentenceClassificationModel(nn.Module):
         h = self.embedding_model(input_ids, attention_mask)
         return self.classifier(masked_mean(h, attention_mask[:, :, None], dim=1))
 
+    def predict(self, input_ids, attention_mask):
+        out = self.forward(input_ids, attention_mask)
+        return out.argmax(dim=1)
+
     def load(self):
         self.embedding_model.load()
 
@@ -300,11 +304,39 @@ class TMixSentenceClassificationModel(nn.Module):
         h = self.sentence_h(masked_mean(h, attention_mask[:, :, None], dim=1))
         return self.classifier(h)
 
+    def predict(self, input_ids, attention_mask):
+        out = self.forward(input_ids, attention_mask)
+        return out.argmax(dim=1)
+
     def load(self):
         self.mix_model.embedding_model.load()
 
     def get_embedding_model(self):
         return self.mix_model.embedding_model
+
+
+class MixupTransformerSentenceClassificationModel(nn.Module):
+    def __init__(self, embedding_model, n_class):
+        super().__init__()
+        self.embedding_model = embedding_model
+        self.classifier = create_sentence_classifier(embedding_model.embed_dim, n_class)
+    
+    def forward(self, input_ids, attention_mask, mixup_indices=None, lambda_=None):
+        h = self.embedding_model(input_ids, attention_mask)
+        h = masked_mean(h, attention_mask[:, :, None], dim=1)
+        if mixup_indices is not None:
+            h = lambda_ * h + (1 - lambda_) * h[mixup_indices]
+        return self.classifier(h)
+
+    def predict(self, input_ids, attention_mask):
+        out = self.forward(input_ids, attention_mask)
+        return out.argmax(dim=1)
+
+    def load(self):
+        self.embedding_model.load()
+
+    def get_embedding_model(self):
+        return self.embedding_model
 
 
 class NonlinearMixSentenceClassificationModel(nn.Module):
@@ -344,7 +376,7 @@ class NonlinearMixSentenceClassificationModel(nn.Module):
         return self.mix_model.embedding_model
 
 
-class AdaMixSentenceClassificationModel(nn.Module):
+class OoMMixSentenceClassificationModel(nn.Module):
     def __init__(self, mix_model, n_class):
         super().__init__()
         self.mix_model = mix_model
@@ -365,6 +397,10 @@ class AdaMixSentenceClassificationModel(nn.Module):
             mix_out = self.classifier(mix_h)
             return out, mix_out, gamma, intr_loss
         
+    def predict(self, input_ids, attention_mask):
+        out = self.forward(input_ids, attention_mask)
+        return out.argmax(dim=1)
+
     def load(self):
         self.mix_model.embedding_model.load()
 
@@ -388,10 +424,12 @@ def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, 
                                                         mixup_layer=mixup_layer,
                                                         d_class=d_class,
                                                         n_class=n_class)
-    elif augment == "adamix":
-        embedding_model = AdaMix(embedding_model, mixup_layer=mixup_layer,
+    elif augment == "mixuptransformer":
+        model = MixupTransformerSentenceClassificationModel(embedding_model, n_class=n_class)
+    elif augment == "oommix":
+        embedding_model = OoMMix(embedding_model, mixup_layer=mixup_layer,
                                  intrusion_layer=intrusion_layer)
-        model = AdaMixSentenceClassificationModel(embedding_model, n_class)
+        model = OoMMixSentenceClassificationModel(embedding_model, n_class)
     else:
         raise AttributeError("Invalid augment")
     return model
