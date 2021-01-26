@@ -353,8 +353,8 @@ if __name__ == "__main__":
 
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
+        print(torch.cuda.current_device())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(torch.cuda.current_device())
     model = create_model(augment=args.mix_strategy, mixup_layer=args.m_layer,
                          intrusion_layer=args.d_layer,
                          n_class=test_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)

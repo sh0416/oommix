@@ -252,6 +252,12 @@ def create_train_and_valid_dataset(dataset, dirpath, augmentation='none', tokeni
                           os.path.join(CACHE_DIR, cache_path, "valid.csv"),
                           os.path.join(CACHE_DIR, cache_path, "valid_tokenized.csv"),
                           tokenizer)
+    # Statistics: Average length
+    length = [len(row["input"]) for row in train_data]
+    logging.info("Train data average length: %.2f" % (sum(length)/len(length)))
+    length = [len(row["input"]) for row in valid_data]
+    logging.info("Valid data average length: %.2f" % (sum(length)/len(length)))
+
     # Calculate the observed token number
     train_token = set(token for row in train_data for token in row["input"])
     valid_token = set(token for row in valid_data for token in row["input"])
@@ -280,6 +286,9 @@ def create_test_dataset(dataset, dirpath, tokenizer=None, return_type="pytorch")
                          os.path.join(CACHE_DIR, cache_path, "test_tokenized.csv"),
                          tokenizer)
     test_data = sorted(test_data, key=lambda x: len(x["input"]), reverse=True)
+    # Statistics: Average length
+    length = [len(row["input"]) for row in test_data]
+    logging.info("Test data average length: %.2f" % (sum(length)/len(length)))
     if return_type == "pytorch":
         test_dataset = ListDataset(test_data, n_class)
     elif return_type == "pandas":
