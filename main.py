@@ -87,7 +87,7 @@ def calculate_mixuptransformer_loss(model, criterion, input_ids, attention_mask,
 
 def calculate_oommix_loss(model, criterion, input_ids, attention_mask,
                           labels, mixup_indices, eps, epoch, step, writer):
-    outs, mix_outs, gamma, intr_loss = model(input_ids=input_ids,
+    outs, mix_outs, gamma, mani_loss = model(input_ids=input_ids,
                                              attention_mask=attention_mask,
                                              mixup_indices=mixup_indices,
                                              eps=eps)
@@ -98,10 +98,10 @@ def calculate_oommix_loss(model, criterion, input_ids, attention_mask,
     loss = (loss1 + loss2) / 2
     if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Loss: %.4f" % (epoch, step, loss))
-        logging.info("[Epoch %d, Step %d] Intrusion loss: %.4f" % (epoch, step, intr_loss))
+        logging.info("[Epoch %d, Step %d] Manifold classification loss: %.4f" % (epoch, step, mani_loss))
     for g in gamma.tolist():
         writer.write("%d,%.4f\n" % (step, g))
-    return loss, intr_loss
+    return loss, mani_loss
 
 
 def plot_representation(model, loader, writer, device, step):
@@ -175,7 +175,7 @@ def train(args, report_func=None):
 
     # Model
     model = create_model(augment=args.mix_strategy, mixup_layer=args.m_layer,
-                         intrusion_layer=args.d_layer,
+                         d_layer=args.d_layer,
                          n_class=train_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
     model.load()     # Load BERT pretrained weight
     model.to(device)
@@ -209,8 +209,8 @@ def train(args, report_func=None):
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
     elif args.mix_strategy == "oommix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
-                      optim.Adam(model.mix_model.policy_region_generator.parameters(), lr=2e-5),
-                      optim.Adam(model.mix_model.intrusion_classifier.parameters(), lr=2e-5),
+                      optim.Adam(model.mix_model.embedding_generator.parameters(), lr=2e-5),
+                      optim.Adam(model.mix_model.manifold_discriminator.parameters(), lr=2e-5),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
 
     # Scheduler
@@ -255,7 +255,7 @@ def train(args, report_func=None):
                 eps = torch.rand(input_ids.shape[0], device=device)
                 loss, intr_loss = calculate_oommix_loss(model, criterion, input_ids,
                         attention_mask, labels, mixup_indices, eps, epoch, step, writer2)
-                # Order is important! Update intrusion parameter and 
+                # Order is important! Update discriminator parameter and 
                 (args.coeff_intr*intr_loss).backward(retain_graph=True)
                 optimizers[0].zero_grad()
                 # Order is important! Update model
@@ -356,7 +356,7 @@ if __name__ == "__main__":
         print(torch.cuda.current_device())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = create_model(augment=args.mix_strategy, mixup_layer=args.m_layer,
-                         intrusion_layer=args.d_layer,
+                         d_layer=args.d_layer,
                          n_class=test_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
     model.to(device)
     model.load_state_dict(torch.load(os.path.join("out", "ckpt", "model_%s.pth" % args.exp_id)))

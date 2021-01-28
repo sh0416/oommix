@@ -175,7 +175,7 @@ class NonlinearMix(nn.Module):
             return h, phi
 
 
-class PolicyRegionGenerator(nn.Module):
+class EmbeddingGenerator(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
         self.mhsa = MultiHeadSelfAttention(embed_dim, 12, 64, 64)
@@ -196,7 +196,7 @@ class PolicyRegionGenerator(nn.Module):
         return outputs[:, 1] * eps + outputs[:, 0]
 
 
-class IntrusionClassifier(nn.Module):
+class ManifoldDiscriminator(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
         self.mhsa = MultiHeadSelfAttention(embed_dim, 12, 64, 64)
@@ -214,47 +214,47 @@ class IntrusionClassifier(nn.Module):
 
 
 class OoMMix(nn.Module):
-    def __init__(self, embedding_model, mixup_layer=0, intrusion_layer=0):
+    def __init__(self, embedding_model, g_layer=0, d_layer=0):
         super().__init__()
         self.embedding_model = embedding_model
-        self.policy_region_generator = PolicyRegionGenerator(embedding_model.embed_dim)
-        self.intrusion_classifier = IntrusionClassifier(embedding_model.embed_dim)
-        self.mixup_layer = mixup_layer
-        self.intrusion_layer = intrusion_layer
-        assert mixup_layer <= intrusion_layer
+        self.embedding_generator = EmbeddingGenerator(embedding_model.embed_dim)
+        self.manifold_discriminator = ManifoldDiscriminator(embedding_model.embed_dim)
+        self.g_layer = g_layer
+        self.d_layer = d_layer
+        assert g_layer <= d_layer
 
     def forward(self, input_ids, attention_mask, mixup_indices=None, eps=None):
         with torch.no_grad():
             h = self.embedding_model.forward_embedding(input_ids)
         for layer_idx, module_dict in enumerate(self.embedding_model.encoder):
             if mixup_indices is not None:
-                if layer_idx == self.mixup_layer:
-                    # Generate Policy Region Generator
-                    gamma = self.policy_region_generator(h, attention_mask, mixup_indices, eps)  # [B]
+                if layer_idx == self.g_layer:
+                    # Generate mixing coefficient
+                    gamma = self.embedding_generator(h, attention_mask, mixup_indices, eps)  # [B]
                     #logging.info("gamma: %.4f" % gamma.mean())
                     mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
                     mix_h = torch.where(attention_mask[:, :, None] & attention_mask[mixup_indices, :, None], mix_h, h)
                     #logging.info("h: %s" % h)
                     #logging.info("h[mixup]: %s" % h[mixup_indices])
                     #logging.info("mix_h: %s" % mix_h)
-                if layer_idx == self.intrusion_layer:
-                    # Intrusion Discriminator
-                    pos = self.intrusion_classifier(h, attention_mask)
-                    neg = self.intrusion_classifier(mix_h, attention_mask)
+                if layer_idx == self.d_layer:
+                    # Manifold Discriminator
+                    pos = self.manifold_discriminator(h, attention_mask)
+                    neg = self.manifold_discriminator(mix_h, attention_mask)
                     output = torch.cat((pos, neg), dim=0)
                     label = torch.cat((torch.ones_like(pos), torch.zeros_like(neg)), dim=0)
                     intr_loss = F.binary_cross_entropy_with_logits(output, label)
-                if layer_idx >= self.mixup_layer:
+                if layer_idx >= self.g_layer:
                     mix_h = self.embedding_model.forward_layer(mix_h, attention_mask, module_dict)
-            if layer_idx >= self.mixup_layer:
+            if layer_idx >= self.g_layer:
                 h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
             else:
                 with torch.no_grad():
                     h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
-        if mixup_indices is not None and 12 == self.intrusion_layer:
-            # Intrusion Discriminator
-            pos = self.intrusion_classifier(h, attention_mask)
-            neg = self.intrusion_classifier(mix_h, attention_mask)
+        if mixup_indices is not None and 12 == self.d_layer:
+            # Manifold Discriminator
+            pos = self.manifold_discriminator(h, attention_mask)
+            neg = self.manifold_discriminator(mix_h, attention_mask)
             output = torch.cat((pos, neg), dim=0)
             label = torch.cat((torch.ones_like(pos), torch.zeros_like(neg)), dim=0)
             intr_loss = F.binary_cross_entropy_with_logits(output, label)
@@ -410,7 +410,7 @@ class OoMMixSentenceClassificationModel(nn.Module):
 
 def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, n_head=12,
                  k_dim=64, v_dim=64, feedforward_dim=3072, n_layer=12, augment='none', 
-                 mixup_layer=3, max_length=256, d_class=16, intrusion_layer=6, n_class=4):
+                 mixup_layer=3, max_length=256, d_class=16, d_layer=12, n_class=4):
     embedding_model = Bert(vocab_size=vocab_size, embed_dim=embed_dim, padding_idx=padding_idx,
                            drop_prob=drop_prob, n_head=n_head, k_dim=k_dim, v_dim=v_dim,
                            feedforward_dim=feedforward_dim, n_layer=n_layer)
@@ -427,8 +427,8 @@ def create_model(vocab_size=30522, embed_dim=768, padding_idx=0, drop_prob=0.1, 
     elif augment == "mixuptransformer":
         model = MixupTransformerSentenceClassificationModel(embedding_model, n_class=n_class)
     elif augment == "oommix":
-        embedding_model = OoMMix(embedding_model, mixup_layer=mixup_layer,
-                                 intrusion_layer=intrusion_layer)
+        embedding_model = OoMMix(embedding_model, g_layer=mixup_layer,
+                                 d_layer=d_layer)
         model = OoMMixSentenceClassificationModel(embedding_model, n_class)
     else:
         raise AttributeError("Invalid augment")
