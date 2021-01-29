@@ -163,7 +163,6 @@ class NonlinearMix(nn.Module):
             assert all(x == y for x, y in zip(h.shape, lambda_.shape))
             h = lambda_ * h + (1 - lambda_) * h[mixup_indices]
             policy_input = F.pad(h, pad=(0, 0, 0, self.max_length-h.shape[1]))
-            logging.debug("policy input shape: %s" % str(policy_input.shape))
             policy_input = policy_input.view(policy_input.shape[0], -1)
             # Policy mapping function F for mixing label embedding vector
             phi = self.policy_mapping_f(policy_input)
@@ -230,13 +229,9 @@ class OoMMix(nn.Module):
             if mixup_indices is not None:
                 if layer_idx == self.g_layer:
                     # Generate mixing coefficient
-                    gamma = self.embedding_generator(h, attention_mask, mixup_indices, eps)  # [B]
-                    #logging.info("gamma: %.4f" % gamma.mean())
-                    mix_h = gamma[:, None, None] * h + (1 - gamma)[:, None, None] * h[mixup_indices]
-                    mix_h = torch.where(attention_mask[:, :, None] & attention_mask[mixup_indices, :, None], mix_h, h)
-                    #logging.info("h: %s" % h)
-                    #logging.info("h[mixup]: %s" % h[mixup_indices])
-                    #logging.info("mix_h: %s" % mix_h)
+                    gamma = self.embedding_generator(h.detach(), attention_mask.detach(), mixup_indices, eps)  # [B]
+                    mix_h = gamma[:, None, None] * h.detach() + (1 - gamma)[:, None, None] * h[mixup_indices].detach()
+                    mix_h = torch.where(attention_mask[:, :, None] & attention_mask[mixup_indices, :, None], mix_h, h.detach())
                 if layer_idx == self.d_layer:
                     # Manifold Discriminator
                     pos = self.manifold_discriminator(h, attention_mask)
@@ -251,6 +246,7 @@ class OoMMix(nn.Module):
             else:
                 with torch.no_grad():
                     h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
+                #h = self.embedding_model.forward_layer(h, attention_mask, module_dict)
         if mixup_indices is not None and 12 == self.d_layer:
             # Manifold Discriminator
             pos = self.manifold_discriminator(h, attention_mask)
