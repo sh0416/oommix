@@ -28,26 +28,32 @@ from utils import Collector, gram_schmidt
 
 config = BertConfig.from_pretrained("bert-base-uncased")
 
-def calculate_normal_loss(model, criterion, input_ids, attention_mask, labels, epoch, step):
+def calculate_normal_loss(model, input_ids, attention_mask, labels, epoch, step):
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    loss = criterion(outputs, labels)
+    loss = F.cross_entropy(outputs, labels)
+    loss.backward()
     if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Loss: %.4f" % (epoch, step, loss))
     return loss
 
 
-def calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels, alpha, epoch, step):
+def create_one_hot(tensor, n_dim):
+    tensor = tensor.unsqueeze(-1)
+    result = torch.zeros(tensor.shape[:-1] + (n_dim,), dtype=torch.float, device=tensor.device)
+    result.scatter_(dim=-1, index=tensor, src=torch.ones_like(tensor, dtype=torch.float))
+    return result
+
+
+def calculate_tmix_loss(model, input_ids, attention_mask, labels, alpha, epoch, step):
     mixup_indices = torch.randperm(input_ids.shape[0], device=input_ids.device)
     lambda_ = np.random.beta(alpha, alpha)
     lambda_ = torch.tensor(np.where(lambda_>=0.5, lambda_, 1-lambda_), dtype=torch.float, device=input_ids.device)
-    outputs = model(input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    mixup_indices=mixup_indices,
-                    lambda_=lambda_)
-    n_class = outputs.shape[1]
-    labels = (labels[:, None] == torch.arange(n_class, device=labels.device).view(1, n_class)).float()
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                    mixup_indices=mixup_indices, lambda_=lambda_)
+    labels = create_one_hot(labels, outputs.shape[1])
     labels = lambda_ * labels + (1 - lambda_) * labels[mixup_indices]
-    loss = criterion(F.log_softmax(outputs, dim=1), labels)
+    loss = F.kl_div(F.log_softmax(outputs, dim=1), labels, reduction="batchmean")
+    loss.backward()
     if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Lambda: %.4f, Loss: %.4f" % (epoch, step, lambda_, loss))
     return loss
@@ -170,7 +176,7 @@ def evaluate(args):
     model.to(device)
     model.load_state_dict(torch.load(os.path.join(args.out_dir, "model.pth")))
 
-    test_acc = evaluate(model, test_loader, device)
+    test_acc = evaluate_model(model, test_loader, device)
     for k, v in vars(args).items():
         logging.info("Parameter %s = %s" % (k, str(v)))
     logging.info("Test accuracy: %.4f" % test_acc)
@@ -211,11 +217,7 @@ def train(args):
     model.to(device)
 
     # Criterion
-    if args.mix_strategy == "none":
-        criterion = nn.CrossEntropyLoss()
-    elif args.mix_strategy == "tmix":
-        criterion = nn.KLDivLoss(reduction="batchmean")
-    elif args.mix_strategy == "nonlinearmix":
+    if args.mix_strategy == "nonlinearmix":
         criterion = None
     elif args.mix_strategy == "mixuptransformer":
         criterion = nn.KLDivLoss(reduction="batchmean")
@@ -262,13 +264,9 @@ def train(args):
             attention_mask = batch["inputs"]["attention_mask"].to(device) 
             labels = batch["labels"].to(device)
             if args.mix_strategy == "none":
-                loss = calculate_normal_loss(model, criterion, input_ids, attention_mask, labels,
-                                             epoch, step)
-                loss.backward()
+                calculate_normal_loss(model, input_ids, attention_mask, labels, epoch, step)
             elif args.mix_strategy == "tmix":
-                loss = calculate_tmix_loss(model, criterion, input_ids, attention_mask, labels,
-                                           args.alpha, epoch, step)
-                loss.backward()
+                calculate_tmix_loss(model, input_ids, attention_mask, labels, args.alpha, epoch, step)
             elif args.mix_strategy == "nonlinearmix":
                 loss = calculate_nonlinearmix_loss(model, criterion, input_ids, attention_mask, labels,
                                                    args.alpha, epoch, step)
