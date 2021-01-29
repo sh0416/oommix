@@ -1,5 +1,6 @@
 import os
 import sys
+import csv
 import json
 import uuid
 import shutil
@@ -28,6 +29,14 @@ from utils import Collector, gram_schmidt
 
 config = BertConfig.from_pretrained("bert-base-uncased")
 
+
+def create_one_hot(tensor, n_dim):
+    tensor = tensor.unsqueeze(-1)
+    result = torch.zeros(tensor.shape[:-1] + (n_dim,), dtype=torch.float, device=tensor.device)
+    result.scatter_(dim=-1, index=tensor, src=torch.ones_like(tensor, dtype=torch.float))
+    return result
+
+
 def calculate_normal_loss(model, input_ids, attention_mask, labels, epoch, step):
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
     loss = F.cross_entropy(outputs, labels)
@@ -35,13 +44,6 @@ def calculate_normal_loss(model, input_ids, attention_mask, labels, epoch, step)
     if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Loss: %.4f" % (epoch, step, loss))
     return loss
-
-
-def create_one_hot(tensor, n_dim):
-    tensor = tensor.unsqueeze(-1)
-    result = torch.zeros(tensor.shape[:-1] + (n_dim,), dtype=torch.float, device=tensor.device)
-    result.scatter_(dim=-1, index=tensor, src=torch.ones_like(tensor, dtype=torch.float))
-    return result
 
 
 def calculate_tmix_loss(model, input_ids, attention_mask, labels, alpha, epoch, step):
@@ -59,7 +61,7 @@ def calculate_tmix_loss(model, input_ids, attention_mask, labels, alpha, epoch, 
     return loss
 
 
-def calculate_nonlinearmix_loss(model, criterion, input_ids, attention_mask, labels, alpha, epoch, step):
+def calculate_nonlinearmix_loss(model, input_ids, attention_mask, labels, alpha, epoch, step):
     mixup_indices = torch.randperm(input_ids.shape[0], device=input_ids.device)
     lambda_ = np.random.beta(alpha, alpha,
             size=(input_ids.shape[0], input_ids.shape[1], model.get_embedding_model().embed_dim))
@@ -69,33 +71,31 @@ def calculate_nonlinearmix_loss(model, criterion, input_ids, attention_mask, lab
     l2 = model.get_label_embedding(labels[mixup_indices])
     mix_l = l1 * phi + (1 - phi) * l2   # [B, D_L]
     loss = -F.cosine_similarity(out, mix_l).mean()
+    loss.backward()
     if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Loss: %.4f" % (epoch, step, loss))
     return loss
 
 
-def calculate_mixuptransformer_loss(model, criterion, input_ids, attention_mask, labels, epoch, step):
+def calculate_mixuptransformer_loss(model, input_ids, attention_mask, labels, epoch, step):
     mixup_indices = torch.randperm(input_ids.shape[0], device=input_ids.device)
     lambda_ = 0.5
-    outputs = model(input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    mixup_indices=mixup_indices,
-                    lambda_=lambda_)
-    n_class = outputs.shape[1]
-    labels = (labels[:, None] == torch.arange(n_class, device=labels.device).view(1, n_class)).float()
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                    mixup_indices=mixup_indices, lambda_=lambda_)
+    labels = create_one_hot(labels, outputs.shape[1])
     labels = lambda_ * labels + (1 - lambda_) * labels[mixup_indices]
-    loss = criterion(F.log_softmax(outputs, dim=1), labels)
+    loss = F.kl_div(F.log_softmax(outputs, dim=1), labels, reduction="batchmean")
+    loss.backward()
     if step % 10 == 0:
         logging.info("[Epoch %d, Step %d] Lambda: %.4f, Loss: %.4f" % (epoch, step, lambda_, loss))
     return loss
 
 
-def calculate_oommix_loss(model, criterion, input_ids, attention_mask,
-                          labels, mixup_indices, eps, epoch, step, writer):
-    outs, mix_outs, gamma, mani_loss = model(input_ids=input_ids,
-                                             attention_mask=attention_mask,
-                                             mixup_indices=mixup_indices,
-                                             eps=eps)
+def calculate_oommix_loss(model, criterion, input_ids, attention_mask, labels, epoch, step, writer):
+    mixup_indices = torch.randperm(input_ids.shape[0], device=device)
+    eps = torch.rand(input_ids.shape[0], device=device)
+    outs, mix_outs, gamma, mani_loss = model(input_ids=input_ids, attention_mask=attention_mask,
+                                             mixup_indices=mixup_indices, eps=eps)
     loss1 = criterion(outs, labels).mean()
     loss21 = criterion(mix_outs, labels)
     loss22 = criterion(mix_outs, labels[mixup_indices])
@@ -219,8 +219,6 @@ def train(args):
     # Criterion
     if args.mix_strategy == "nonlinearmix":
         criterion = None
-    elif args.mix_strategy == "mixuptransformer":
-        criterion = nn.KLDivLoss(reduction="batchmean")
     else:
         criterion = nn.CrossEntropyLoss()
 
@@ -250,8 +248,11 @@ def train(args):
                   for optimizer in optimizers]
 
     # Writer
-    writer = SummaryWriter(args.out_dir)
-    writer2 = open(os.path.join(args.out_dir, "gamma.csv"), "w")
+    writers = {
+        "tensorboard": SummaryWriter(args.out_dir),
+        "gamma": open(os.path.join(args.out_dir, "gamma.csv"), "w"),
+        "train_loss": open(os.path.join(args.out_dir, "train_loss.csv"), "w")
+    }
 
     step, best_acc, patience = 0, 0, 0
     model.train()
@@ -264,31 +265,22 @@ def train(args):
             attention_mask = batch["inputs"]["attention_mask"].to(device) 
             labels = batch["labels"].to(device)
             if args.mix_strategy == "none":
-                calculate_normal_loss(model, input_ids, attention_mask, labels, epoch, step)
+                loss = calculate_normal_loss(model, input_ids, attention_mask, labels, epoch, step)
             elif args.mix_strategy == "tmix":
-                calculate_tmix_loss(model, input_ids, attention_mask, labels, args.alpha, epoch, step)
+                loss = calculate_tmix_loss(model, input_ids, attention_mask, labels, args.alpha, epoch, step)
             elif args.mix_strategy == "nonlinearmix":
-                loss = calculate_nonlinearmix_loss(model, criterion, input_ids, attention_mask, labels,
-                                                   args.alpha, epoch, step)
-                loss.backward()
+                loss = calculate_nonlinearmix_loss(model, input_ids, attention_mask, labels, args.alpha, epoch, step)
             elif args.mix_strategy == "mixuptransformer":
-                loss = calculate_mixuptransformer_loss(model, criterion, input_ids, attention_mask, labels,
-                                                       epoch, step)
-                loss.backward()
+                loss = calculate_mixuptransformer_loss(model, criterion, input_ids, attention_mask, labels, epoch, step)
             elif args.mix_strategy == "oommix":
-                mixup_indices = torch.randperm(input_ids.shape[0], device=device)
-                eps = torch.rand(input_ids.shape[0], device=device)
-                loss, intr_loss = calculate_oommix_loss(model, criterion, input_ids,
-                        attention_mask, labels, mixup_indices, eps, epoch, step, writer2)
-                # Order is important! Update discriminator parameter and 
+                loss, intr_loss = calculate_oommix_loss(model, criterion, input_ids, attention_mask, labels, mixup_indices, eps, epoch, step, writer2)
+                # Order is important! Gradient for discriminator and generator 
                 (args.coeff_intr*intr_loss).backward(retain_graph=True)
                 optimizers[0].zero_grad()
-                # Order is important! Update model
+                # Order is important! Gradient for model and generator
                 ((1-args.coeff_intr)*loss).backward()
-                for name, p in model.named_parameters():
-                    if p.requires_grad == True:
-                        value = 0 if p.grad is None else p.grad.data.norm(2)
-                        writer.add_scalar("grad/%s" % name, value, step)
+            if step % 5 == 0:
+                writers["train_loss"].write("%d,%.4f\n" % (int(datetime.now().timestamp()), loss.item()))
             for optimizer in optimizers:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -313,9 +305,9 @@ def train(args):
                     break
         if patience == args.patience:
             break
-    writer.close()
-    writer2.close()
-
+    for w in writers.values():
+        w.close()
+    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -349,7 +341,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
     args.out_dir = os.path.join("out", str(uuid.uuid4())[:12])
-
+    
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
@@ -358,7 +350,7 @@ if __name__ == "__main__":
                         stream=sys.stdout,
                         #filename=os.path.join("out", "log", args.exp_id),
                         format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
-    #logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
+    logging.info("OUTPUT DIRECTORY: %s" % args.out_dir)
     try:
         train(args)
         evaluate(args)
