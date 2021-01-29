@@ -1,13 +1,6 @@
-runs/
-dataset/
-wandb/
 __pycache__/
 .ipynb_checkpoints/
 .vscode/
+dataset/
 cache/
-log/
-ckpt/
-param/
-res/
-run/
-gamma/
+out/

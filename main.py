@@ -2,8 +2,10 @@ import os
 import sys
 import json
 import uuid
+import shutil
 import logging
 import argparse
+import traceback
 from datetime import datetime
 import numpy as np
 import torch
@@ -16,18 +18,15 @@ from torchvision.utils import make_grid
 from transformers import BertModel, BertConfig, BertTokenizerFast
 import matplotlib
 import matplotlib.pyplot as plt
-#from torchviz import make_dot
 from tqdm import tqdm
 from data import create_train_and_valid_dataset, CollateFn
 from data import create_test_dataset
 from model import create_model
 from utils import Collector, gram_schmidt
 
-matplotlib.use('Agg')
 #torch.set_printoptions(profile="full", linewidth=150)
 
 config = BertConfig.from_pretrained("bert-base-uncased")
-
 
 def calculate_normal_loss(model, criterion, input_ids, attention_mask, labels, epoch, step):
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -135,7 +134,7 @@ def plot_representation(model, loader, writer, device, step):
     collector.remove_all_hook()
 
 
-def evaluate(model, loader, device):
+def evaluate_model(model, loader, device):
     with torch.no_grad():
         model.eval()
         correct, count = 0, 0
@@ -152,7 +151,37 @@ def evaluate(model, loader, device):
     return acc.item()
 
 
-def train(args, report_func=None):
+def evaluate(args):
+    tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+    test_dataset = create_test_dataset(dataset=args.dataset,
+                                       dirpath=args.data_dir,
+                                       tokenizer=tokenizer)
+    collate_fn = CollateFn(tokenizer, args.max_length)
+    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False,
+                             collate_fn=collate_fn)
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
+        logging.info("CUDA DEVICE: %d" % torch.cuda.current_device())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = create_model(augment=args.mix_strategy, mixup_layer=args.m_layer,
+                         d_layer=args.d_layer,
+                         n_class=test_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
+    model.to(device)
+    model.load_state_dict(torch.load(os.path.join(args.out_dir, "model.pth")))
+
+    test_acc = evaluate(model, test_loader, device)
+    for k, v in vars(args).items():
+        logging.info("Parameter %s = %s" % (k, str(v)))
+    logging.info("Test accuracy: %.4f" % test_acc)
+
+    with open(os.path.join(args.out_dir, "param.json"), 'w') as f:
+        args = vars(args)
+        args["test_acc"] = test_acc
+        json.dump(args, f, indent=2)
+
+
+def train(args):
     # Dataset
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
     train_dataset, valid_dataset = create_train_and_valid_dataset(
@@ -171,6 +200,7 @@ def train(args, report_func=None):
     # Device
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
+        logging.info("CUDA DEVICE: %d" % torch.cuda.current_device())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Model
@@ -218,12 +248,8 @@ def train(args, report_func=None):
                   for optimizer in optimizers]
 
     # Writer
-    writer = SummaryWriter(os.path.join("out", "run", args.exp_id))
-    logging.info("Tensorboard dir: %s" % os.path.join("out", "run", args.exp_id))
-
-    # Gamma
-    os.makedirs(os.path.join("out", "gamma"), exist_ok=True)
-    writer2 = open(os.path.join("out", "gamma", "%s_gamma.csv" % args.exp_id), "w")
+    writer = SummaryWriter(args.out_dir)
+    writer2 = open(os.path.join(args.out_dir, "gamma.csv"), "w")
 
     step, best_acc, patience = 0, 0, 0
     model.train()
@@ -231,6 +257,7 @@ def train(args, report_func=None):
         optimizer.zero_grad()
     for epoch in range(1, args.epoch+1):
         for batch in train_loader:
+            step += 1
             input_ids = batch["inputs"]["input_ids"].to(device) 
             attention_mask = batch["inputs"]["attention_mask"].to(device) 
             labels = batch["labels"].to(device)
@@ -275,24 +302,17 @@ def train(args, report_func=None):
                     gs = torch.from_numpy(gram_schmidt(model.label_matrix.t().cpu().numpy())).t().to(device)
                     model.label_matrix.copy_(gs)
             
-            step += 1
-            if step % 50 == 0:
-                #plot_representation(model, plot_loader, writer, device, step)
-                pass
             if step % args.eval_every == 0:
-                acc = evaluate(model, valid_loader, device)
+                acc = evaluate_model(model, valid_loader, device)
                 if best_acc < acc:
                     best_acc = acc
                     patience = 0
-                    os.makedirs(os.path.join("out", "ckpt"), exist_ok=True)
-                    torch.save(model.state_dict(), os.path.join("out", "ckpt", "./model_%s.pth" % args.exp_id))
+                    torch.save(model.state_dict(), os.path.join(args.out_dir, "model.pth"))
                 else:
                     patience += 1
                 logging.info("Accuracy: %.4f, Best accuracy: %.4f" % (acc, best_acc))
                 if patience == args.patience:
                     break
-                if report_func is not None:
-                    report_func(accuracy=acc, best_accuracy=best_acc)
         if patience == args.patience:
             break
     writer.close()
@@ -330,44 +350,20 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
-    args.exp_id = str(uuid.uuid4())[:12]
+    args.out_dir = os.path.join("out", str(uuid.uuid4())[:12])
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-    os.makedirs(os.path.join("out", "log"), exist_ok=True)
+    os.makedirs(args.out_dir)
     logging.basicConfig(level=logging.INFO,
                         stream=sys.stdout,
                         #filename=os.path.join("out", "log", args.exp_id),
                         format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
     #logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, format="%(levelname)s - %(pathname)s - %(asctime)s - %(message)s")
-    train(args)
-
-    tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-    test_dataset = create_test_dataset(dataset=args.dataset,
-                                       dirpath=args.data_dir,
-                                       tokenizer=tokenizer)
-    collate_fn = CollateFn(tokenizer, args.max_length)
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False,
-                             collate_fn=collate_fn)
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(args.gpu)
-        print(torch.cuda.current_device())
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_model(augment=args.mix_strategy, mixup_layer=args.m_layer,
-                         d_layer=args.d_layer,
-                         n_class=test_dataset.n_class, n_layer=12, drop_prob=args.drop_prob)
-    model.to(device)
-    model.load_state_dict(torch.load(os.path.join("out", "ckpt", "model_%s.pth" % args.exp_id)))
-
-    test_acc = evaluate(model, test_loader, device)
-    for k, v in vars(args).items():
-        logging.info("Parameter %s = %s" % (k, str(v)))
-    logging.info("Test accuracy: %.4f" % test_acc)
-
-    os.makedirs(os.path.join("out", "param"), exist_ok=True)
-    with open(os.path.join("out", "param", args.exp_id+".json"), 'w') as f:
-        args = vars(args)
-        args["test_acc"] = test_acc
-        json.dump(args, f, indent=2)
+    try:
+        train(args)
+        evaluate(args)
+    except:
+        shutil.rmtree(args.out_dir)
+        traceback.print_exc()
