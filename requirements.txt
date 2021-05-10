@@ -1,0 +1,9 @@
+torch
+torchvision
+tensorboard
+transformers
+numpy
+pandas
+matplotlib
+scikit-learn
+nltk
