@@ -92,8 +92,8 @@ def calculate_mixuptransformer_loss(model, input_ids, attention_mask, labels, ep
 
 
 def calculate_oommix_loss(model, criterion, input_ids, attention_mask, labels, epoch, step, writer):
-    mixup_indices = torch.randperm(input_ids.shape[0], device=device)
-    eps = torch.rand(input_ids.shape[0], device=device)
+    mixup_indices = torch.randperm(input_ids.shape[0], device=input_ids.device)
+    eps = torch.rand(input_ids.shape[0], device=input_ids.device)
     outs, mix_outs, gamma, mani_loss = model(input_ids=input_ids, attention_mask=attention_mask,
                                              mixup_indices=mixup_indices, eps=eps)
     loss1 = criterion(outs, labels).mean()
@@ -231,7 +231,7 @@ def train(args):
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
     elif args.mix_strategy == "nonlinearmix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
-                      optim.Adam(model.mix_model.policy_mapping_f.parameters(), lr=2e-5),
+                      optim.Adam(model.mix_model.policy_mapping_f.parameters(), lr=args.lr),
                       optim.Adam(model.classifier.parameters(), lr=1e-3),
                       optim.Adam([model.label_matrix], lr=1e-3)]
     elif args.mix_strategy == "mixuptransformer":
@@ -239,8 +239,8 @@ def train(args):
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
     elif args.mix_strategy == "oommix":
         optimizers = [optim.Adam(model.mix_model.embedding_model.parameters(), lr=args.lr),
-                      optim.Adam(model.mix_model.embedding_generator.parameters(), lr=2e-5),
-                      optim.Adam(model.mix_model.manifold_discriminator.parameters(), lr=2e-5),
+                      optim.Adam(model.mix_model.embedding_generator.parameters(), lr=args.lr),
+                      optim.Adam(model.mix_model.manifold_discriminator.parameters(), lr=args.lr),
                       optim.Adam(model.classifier.parameters(), lr=1e-3)]
 
     # Scheduler
@@ -251,7 +251,7 @@ def train(args):
     writers = {
         "tensorboard": SummaryWriter(args.out_dir),
         "gamma": open(os.path.join(args.out_dir, "gamma.csv"), "w"),
-        "train_loss": open(os.path.join(args.out_dir, "train_loss.csv"), "w")
+        "scalar": open(os.path.join(args.out_dir, "scalar.csv"), "w")
     }
 
     step, best_acc, patience = 0, 0, 0
@@ -273,14 +273,16 @@ def train(args):
             elif args.mix_strategy == "mixuptransformer":
                 loss = calculate_mixuptransformer_loss(model, criterion, input_ids, attention_mask, labels, epoch, step)
             elif args.mix_strategy == "oommix":
-                loss, intr_loss = calculate_oommix_loss(model, criterion, input_ids, attention_mask, labels, mixup_indices, eps, epoch, step, writer2)
+                loss, mani_loss = calculate_oommix_loss(model, criterion, input_ids, attention_mask, labels, epoch, step, writers["gamma"])
                 # Order is important! Gradient for discriminator and generator 
-                (args.coeff_intr*intr_loss).backward(retain_graph=True)
+                (args.coeff_intr*mani_loss).backward(retain_graph=True)
                 optimizers[0].zero_grad()
                 # Order is important! Gradient for model and generator
                 ((1-args.coeff_intr)*loss).backward()
             if step % 5 == 0:
-                writers["train_loss"].write("%d,%.4f\n" % (int(datetime.now().timestamp()), loss.item()))
+                writers["scalar"].write("%d,train loss,%.4f\n" % (int(datetime.now().timestamp()), loss.item()))
+                if args.mix_strategy == "oommix":
+                    writers["scalar"].write("%d,manifold classification loss,%.4f\n" % (int(datetime.now().timestamp()), mani_loss.item()))
             for optimizer in optimizers:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -294,6 +296,7 @@ def train(args):
             
             if step % args.eval_every == 0:
                 acc = evaluate_model(model, valid_loader, device)
+                writers["scalar"].write("%d,valid acc,%.4f\n" % (int(datetime.now().timestamp()), acc))
                 if best_acc < acc:
                     best_acc = acc
                     patience = 0
@@ -312,7 +315,7 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Reproducibility parameter
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1)
     # Data hyperparameter
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="ag_news",
@@ -336,8 +339,8 @@ if __name__ == "__main__":
     parser.add_argument("--d_layer", type=int, default=12)
     parser.add_argument("--alpha", type=float, default=0.2)
     parser.add_argument("--coeff_intr", type=float, default=0.5)
-    parser.add_argument("--eval_every", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--eval_every", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
     args.out_dir = os.path.join("out", str(uuid.uuid4())[:12])
