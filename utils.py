@@ -1,5 +1,6 @@
 import numpy as np
 
+
 class Collector:
     def __init__(self):
         self.activations = {}
@@ -8,6 +9,7 @@ class Collector:
     def create_hook_fn(self, name, fn):
         def hook(model, input, output):
             self.activations[name] = fn(output)
+
         return hook
 
     def collect_representation(self, model):
@@ -17,12 +19,14 @@ class Collector:
             if name in target_names:
                 hook_fn = self.create_hook_fn(name, lambda x: x.detach().cpu())
                 self.handles[name] = module.register_forward_hook(hook_fn)
-        
+
     def collect_attention(self, model):
         target_names = ["encoder.%d.mhsa" % i for i in range(12)]
         for name, module in model.named_modules():
             if name in target_names:
-                hook_fn = self.create_hook_fn(name+"_attn", lambda x: x[1].detach().cpu())
+                hook_fn = self.create_hook_fn(
+                    name + "_attn", lambda x: x[1].detach().cpu()
+                )
                 self.handles[name] = module.register_forward_hook(hook_fn)
 
     def remove_all_hook(self):
