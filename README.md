@@ -1,6 +1,8 @@
 Out-of-manifold Regularization in Contextual Embedding Space for Text Classification
 ====================
 
+Appeared in ACL2021 main conference
+
 ## Download data source
 1. Download tarfile from the [link](https://drive.google.com/drive/folders/0Bz8a_Dbh9Qhbfll6bVpmNUtUcFdjYmF2SEpmZUZUcVNiMUw1TWN6RDV3a0JHT3kxLVhVR2M?usp=sharing)
 1. Extract tarfile
